@@ -1,0 +1,34 @@
+# Local tool / editor config (contains machine-specific paths)
+.claude/
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Built launcher (build it locally with build_launcher.sh)
+Inventory Manager.app/
+*.app/
+
+# Inventory data — never commit real inventory contents
+InventoryData/
+by_category/
+inventory.csv
+categories.csv
+history.csv
+*.xlsx
+*.xlsm
+
+# Logs
+*.log

@@ -1,0 +1,1555 @@
+#!/usr/bin/env python3
+"""
+Department Inventory Manager
+----------------------------
+A single-user web app for managing categorized inventory (units, electronics, etc.).
+
+- Dynamic category / subcategory tree (any depth)
+- Items with dynamic custom fields (serial number, origin, notes, ...) only where needed
+- Per-category required-field templates (auto-applied to new items in that category)
+- Auto-save on every change (no save button)
+- Full change history with timestamps
+- Data stored as Excel-readable CSV files on a folder you choose (e.g. a shared drive)
+
+Run:
+    python app.py
+Then open http://127.0.0.1:8765 in your browser (it opens automatically).
+
+The first time it runs it asks (in the browser) for a data folder, or you can set
+the INVENTORY_DIR environment variable to point at your shared drive.
+"""
+
+import csv
+import os
+import re
+import sys
+import json
+import uuid
+import shutil
+import threading
+import subprocess
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from flask import Flask, request, jsonify, Response
+except ModuleNotFoundError:
+    sys.stderr.write(
+        "\n[Inventory Manager] Flask is not installed.\n"
+        "Install it with:\n\n"
+        "    python3 -m pip install flask\n\n"
+        "then run this program again.\n\n"
+    )
+    sys.exit(1)
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+
+APP = Flask(__name__)
+LOCK = threading.RLock()  # single-user, but guards against overlapping requests
+
+# Where the CSVs live. Change this, set INVENTORY_DIR, or pick a folder in the UI.
+DEFAULT_DIR = os.environ.get(
+    "INVENTORY_DIR",
+    str(Path.home() / "InventoryData"),
+)
+
+CONFIG_FILE = Path.home() / ".inventory_manager_config.json"
+
+INVENTORY_CSV = "inventory.csv"
+CATEGORIES_CSV = "categories.csv"
+HISTORY_CSV = "history.csv"
+
+# Human-readable mirror: one CSV per top-level category, subcategories as
+# labelled sections inside it. inventory.csv stays the master copy.
+HIER_DIR = "by_category"
+HIER_MARKER = "# Inventory Manager - readable category view (auto-generated)"
+UNCATEGORIZED = "_Uncategorized"
+
+# Fixed base columns that always exist on every item row.
+BASE_COLUMNS = ["id", "category_path", "name", "quantity", "date_added", "last_modified"]
+
+
+# ----------------------------------------------------------------------------
+# Data directory resolution
+# ----------------------------------------------------------------------------
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_config(cfg):
+    try:
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def get_data_dir():
+    cfg = load_config()
+    d = cfg.get("data_dir") or DEFAULT_DIR
+    return Path(d)
+
+
+def set_data_dir(path):
+    cfg = load_config()
+    cfg["data_dir"] = str(path)
+    save_config(cfg)
+
+
+def paths():
+    d = get_data_dir()
+    return (
+        d,
+        d / INVENTORY_CSV,
+        d / CATEGORIES_CSV,
+        d / HISTORY_CSV,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Native "choose folder" dialog (the server runs on the same machine as the UI)
+# ----------------------------------------------------------------------------
+
+def native_picker_available():
+    """True if this machine has an OS folder-picker we know how to invoke."""
+    if sys.platform == "darwin":
+        return shutil.which("osascript") is not None
+    if os.name == "nt":
+        return shutil.which("powershell") is not None
+    return shutil.which("zenity") is not None or shutil.which("kdialog") is not None
+
+
+def pick_directory_native():
+    """
+    Open the OS folder chooser and return the selected path, or None if the
+    user cancelled or no native dialog is available. Blocks until the user picks.
+    """
+    try:
+        if sys.platform == "darwin":
+            script = ('POSIX path of (choose folder with prompt '
+                      '"Choose a folder for your inventory data")')
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=300)
+            return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+        if os.name == "nt":
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }"
+            )
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True, text=True, timeout=300)
+            return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+        # Linux
+        for cmd in (["zenity", "--file-selection", "--directory",
+                     "--title=Choose a folder for your inventory data"],
+                    ["kdialog", "--getexistingdirectory", str(Path.home())]):
+            if shutil.which(cmd[0]):
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+        return None
+    except Exception:
+        return None
+
+
+def pick_file_native():
+    """Open the OS file chooser for a spreadsheet. Returns a path or None."""
+    try:
+        if sys.platform == "darwin":
+            script = ('POSIX path of (choose file with prompt '
+                      '"Choose a spreadsheet to import" of type '
+                      '{"csv","xlsx","xlsm","tsv","txt"})')
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=300)
+            return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+        if os.name == "nt":
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$f = New-Object System.Windows.Forms.OpenFileDialog; "
+                "$f.Filter = 'Spreadsheets|*.csv;*.xlsx;*.xlsm;*.tsv;*.txt|All files|*.*'; "
+                "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }"
+            )
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True, text=True, timeout=300)
+            return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+        for cmd in (["zenity", "--file-selection",
+                     "--title=Choose a spreadsheet to import"],
+                    ["kdialog", "--getopenfilename", str(Path.home())]):
+            if shutil.which(cmd[0]):
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+        return None
+    except Exception:
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Low-level CSV helpers
+# ----------------------------------------------------------------------------
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_files():
+    """Create the data folder and empty CSVs if they don't exist yet."""
+    d, inv, cats, hist = paths()
+    d.mkdir(parents=True, exist_ok=True)
+    if not inv.exists():
+        write_inventory([], [], sync_view=False)
+    if not cats.exists():
+        with cats.open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["category_path", "required_fields"])
+    if not hist.exists():
+        with hist.open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp", "action", "target", "detail"])
+
+
+def read_inventory():
+    """Return (rows, custom_field_names). Each row is a dict."""
+    _, inv, _, _ = paths()
+    if not inv.exists():
+        return [], []
+    with inv.open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        header = reader.fieldnames or list(BASE_COLUMNS)
+        rows = [dict(r) for r in reader]
+    custom = [c for c in header if c not in BASE_COLUMNS]
+    # normalise: make sure every row has every column key
+    for r in rows:
+        for c in header:
+            r.setdefault(c, "")
+    return rows, custom
+
+
+def write_inventory(rows, custom_fields, sync_view=True):
+    """Write all item rows. custom_fields is the union of extra columns."""
+    _, inv, _, _ = paths()
+    header = list(BASE_COLUMNS) + list(custom_fields)
+    with inv.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            clean = {k: r.get(k, "") for k in header}
+            w.writerow(clean)
+    if sync_view:
+        write_hierarchy()
+
+
+def read_categories():
+    """Return dict: category_path -> [required_field, ...]."""
+    _, _, cats, _ = paths()
+    result = {}
+    if not cats.exists():
+        return result
+    with cats.open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            path = (r.get("category_path") or "").strip()
+            if not path:
+                continue
+            req = (r.get("required_fields") or "").strip()
+            result[path] = [x.strip() for x in req.split("|") if x.strip()]
+    return result
+
+
+def write_categories(cat_map, sync_view=True):
+    _, _, cats, _ = paths()
+    with cats.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["category_path", "required_fields"])
+        for path in sorted(cat_map.keys()):
+            w.writerow([path, "|".join(cat_map[path])])
+    if sync_view:
+        write_hierarchy()
+
+
+def log_history(action, target, detail=""):
+    _, _, _, hist = paths()
+    with hist.open("a", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow([now_str(), action, target, detail])
+
+
+# ----------------------------------------------------------------------------
+# Readable per-category mirror (one CSV per top-level category, with sections)
+# ----------------------------------------------------------------------------
+
+def safe_filename(name):
+    """Turn a category name into something safe for a file name."""
+    cleaned = re.sub(r'[<>:"/\\|?*\r\n]', "_", str(name)).strip().rstrip(".")
+    return cleaned or "_"
+
+
+def write_hierarchy():
+    """
+    Rebuild <data_dir>/by_category/: one CSV per top-level category, each
+    containing '=== Full/Category/Path ===' sections with that category's own
+    items. Purely a readable view -- inventory.csv remains the master.
+    """
+    d, _, _, _ = paths()
+    out_dir = d / HIER_DIR
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    rows, _ = read_inventory()
+    cat_map = read_categories()
+
+    # every category path that exists (stored, implied by items, or an ancestor)
+    all_paths = set(cat_map.keys())
+    for r in rows:
+        p = (r.get("category_path") or "").strip()
+        if p:
+            all_paths.add(p)
+    for p in list(all_paths):
+        parts = p.split("/")
+        for i in range(1, len(parts)):
+            all_paths.add("/".join(parts[:i]))
+    all_paths.discard("")
+
+    # items grouped by their exact category
+    by_cat = {}
+    for r in rows:
+        by_cat.setdefault((r.get("category_path") or "").strip(), []).append(r)
+
+    # group category paths under their top-level name
+    tops = {}
+    for p in all_paths:
+        tops.setdefault(p.split("/")[0], []).append(p)
+    if by_cat.get(""):
+        tops.setdefault(UNCATEGORIZED, [])
+
+    generated = set()
+    for top in sorted(tops.keys()):
+        sections = sorted(tops[top])
+        if top == UNCATEGORIZED:
+            sections = [""]
+        fname = safe_filename(top) + ".csv"
+        target = out_dir / fname
+        total = sum(len(by_cat.get(s, [])) for s in sections)
+        try:
+            with target.open("w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow([HIER_MARKER])
+                w.writerow([f"# Category: {top}"])
+                w.writerow([f"# Subcategories: {len(sections)}   Items: {total}"])
+                w.writerow([f"# Updated: {now_str()}"])
+                w.writerow(["# Master data lives in inventory.csv - edits here are overwritten."])
+                w.writerow([])
+                for sec in sections:
+                    items = by_cat.get(sec, [])
+                    label = sec if sec else UNCATEGORIZED
+                    req = cat_map.get(sec, [])
+                    w.writerow([f"=== {label} ==="])
+                    if req:
+                        w.writerow([f"# required fields: {', '.join(req)}"])
+                    # only show custom columns that this section actually uses
+                    used = []
+                    for it in items:
+                        for k, v in it.items():
+                            if k not in BASE_COLUMNS and str(v).strip() and k not in used:
+                                used.append(k)
+                    cols = ["id", "name", "quantity"] + used + ["date_added", "last_modified"]
+                    w.writerow(cols)
+                    if not items:
+                        w.writerow(["(no items in this category)"])
+                    for it in sorted(items, key=lambda x: (x.get("name") or "").lower()):
+                        w.writerow([it.get(c, "") for c in cols])
+                    w.writerow([])
+            generated.add(fname)
+        except Exception:
+            continue
+
+    # overview index so the folder explains itself at a glance
+    try:
+        with (out_dir / "_Overview.csv").open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([HIER_MARKER])
+            w.writerow([f"# Updated: {now_str()}"])
+            w.writerow([])
+            w.writerow(["category_path", "depth", "direct_items",
+                        "items_incl_subcategories", "required_fields", "file"])
+            for p in sorted(all_paths):
+                direct = len(by_cat.get(p, []))
+                deep = sum(len(v) for k, v in by_cat.items()
+                           if k == p or k.startswith(p + "/"))
+                w.writerow([p, p.count("/") + 1, direct, deep,
+                            "|".join(cat_map.get(p, [])),
+                            safe_filename(p.split("/")[0]) + ".csv"])
+            if by_cat.get(""):
+                w.writerow([UNCATEGORIZED, 0, len(by_cat[""]), len(by_cat[""]), "",
+                            UNCATEGORIZED + ".csv"])
+        generated.add("_Overview.csv")
+    except Exception:
+        pass
+
+    # drop stale files we generated earlier (never touch files we didn't write)
+    try:
+        for old in out_dir.glob("*.csv"):
+            if old.name in generated:
+                continue
+            try:
+                with old.open("r", encoding="utf-8-sig") as f:
+                    first = f.readline()
+                if first.startswith(HIER_MARKER[:30]):
+                    old.unlink()
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def read_history(limit=500):
+    _, _, _, hist = paths()
+    if not hist.exists():
+        return []
+    with hist.open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        rows = [dict(r) for r in reader]
+    rows.reverse()  # newest first
+    return rows[:limit]
+
+
+# ----------------------------------------------------------------------------
+# Domain logic
+# ----------------------------------------------------------------------------
+
+def all_category_paths():
+    """
+    Every category path that exists: those explicitly stored (incl. empty ones)
+    plus any implied by an item's category_path or by a child path.
+    """
+    cat_map = read_categories()
+    paths_set = set(cat_map.keys())
+
+    rows, _ = read_inventory()
+    for r in rows:
+        p = (r.get("category_path") or "").strip()
+        if p:
+            paths_set.add(p)
+
+    # ensure all ancestors exist
+    for p in list(paths_set):
+        parts = p.split("/")
+        for i in range(1, len(parts)):
+            paths_set.add("/".join(parts[:i]))
+
+    paths_set.discard("")
+    return paths_set, cat_map
+
+
+def build_tree():
+    paths_set, cat_map = all_category_paths()
+    rows, custom = read_inventory()
+
+    counts = {}
+    for r in rows:
+        p = (r.get("category_path") or "").strip()
+        # count item toward its category and all ancestors
+        parts = p.split("/") if p else []
+        for i in range(1, len(parts) + 1):
+            key = "/".join(parts[:i])
+            counts[key] = counts.get(key, 0) + 1
+
+    # nested structure
+    root = {}
+    for p in sorted(paths_set):
+        parts = p.split("/")
+        node = root
+        for i, part in enumerate(parts):
+            cur_path = "/".join(parts[: i + 1])
+            if part not in node:
+                node[part] = {
+                    "_path": cur_path,
+                    "_children": {},
+                    "_count": counts.get(cur_path, 0),
+                    "_required": cat_map.get(cur_path, []),
+                }
+            node = node[part]["_children"]
+
+    def to_list(node):
+        out = []
+        for name in sorted(node.keys()):
+            n = node[name]
+            out.append(
+                {
+                    "name": name,
+                    "path": n["_path"],
+                    "count": n["_count"],
+                    "required_fields": n["_required"],
+                    "children": to_list(n["_children"]),
+                }
+            )
+        return out
+
+    return to_list(root)
+
+
+def inherited_required_fields(category_path):
+    """Required fields from this category and all its ancestors."""
+    cat_map = read_categories()
+    fields = []
+    parts = category_path.split("/") if category_path else []
+    for i in range(1, len(parts) + 1):
+        key = "/".join(parts[:i])
+        for fld in cat_map.get(key, []):
+            if fld not in fields:
+                fields.append(fld)
+    return fields
+
+
+def sanitize_field_name(name):
+    name = name.strip()
+    # keep it Excel-friendly and safe as a CSV column header
+    name = re.sub(r"[\r\n,]", " ", name)
+    return name
+
+
+# ----------------------------------------------------------------------------
+# API routes
+# ----------------------------------------------------------------------------
+
+@APP.route("/api/state")
+def api_state():
+    with LOCK:
+        ensure_files()
+        rows, custom = read_inventory()
+        tree = build_tree()
+        d = str(get_data_dir())
+        return jsonify(
+            {
+                "tree": tree,
+                "custom_fields": custom,
+                "base_columns": BASE_COLUMNS,
+                "data_dir": d,
+                "item_count": len(rows),
+                "can_browse": native_picker_available(),
+            }
+        )
+
+
+@APP.route("/api/items")
+def api_items():
+    """Items in a given category (optionally including subcategories)."""
+    with LOCK:
+        ensure_files()
+        cat = request.args.get("category", "").strip()
+        include_sub = request.args.get("include_sub", "0") == "1"
+        search = request.args.get("search", "").strip().lower()
+        rows, custom = read_inventory()
+
+        def match_cat(p):
+            if not cat:
+                return True
+            if include_sub:
+                return p == cat or p.startswith(cat + "/")
+            return p == cat
+
+        result = []
+        for r in rows:
+            p = (r.get("category_path") or "").strip()
+            if not match_cat(p):
+                continue
+            if search:
+                blob = " ".join(str(v) for v in r.values()).lower()
+                if search not in blob:
+                    continue
+            result.append(r)
+        return jsonify({"items": result, "custom_fields": custom})
+
+
+@APP.route("/api/item", methods=["POST"])
+def api_item_save():
+    """Create or update a single item."""
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        rows, custom = read_inventory()
+
+        item_id = data.get("id") or ""
+        fields = data.get("fields", {})  # {column: value}
+        category = (fields.get("category_path") or "").strip()
+        name = (fields.get("name") or "").strip()
+
+        if not name:
+            return jsonify({"error": "Name is required."}), 400
+
+        # discover any new custom columns
+        for key in fields.keys():
+            if key not in BASE_COLUMNS and key not in custom:
+                custom.append(sanitize_field_name(key))
+
+        ts = now_str()
+        if item_id:
+            found = None
+            for r in rows:
+                if r.get("id") == item_id:
+                    found = r
+                    break
+            if not found:
+                return jsonify({"error": "Item not found."}), 404
+            old = dict(found)
+            for k, v in fields.items():
+                found[k] = v
+            found["last_modified"] = ts
+            changed = [
+                k for k in fields
+                if str(old.get(k, "")) != str(fields.get(k, ""))
+            ]
+            log_history("edit_item", f"{category}/{name}",
+                        "changed: " + ", ".join(changed) if changed else "no field changes")
+        else:
+            new_id = uuid.uuid4().hex[:12]
+            row = {c: "" for c in BASE_COLUMNS + custom}
+            row.update(fields)
+            row["id"] = new_id
+            row["date_added"] = ts
+            row["last_modified"] = ts
+            rows.append(row)
+            log_history("add_item", f"{category}/{name}", f"id={new_id}")
+
+        write_inventory(rows, custom)
+        return jsonify({"ok": True})
+
+
+@APP.route("/api/item/delete", methods=["POST"])
+def api_item_delete():
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        item_id = data.get("id")
+        rows, custom = read_inventory()
+        target = None
+        for r in rows:
+            if r.get("id") == item_id:
+                target = r
+                break
+        if not target:
+            return jsonify({"error": "Item not found."}), 404
+        rows = [r for r in rows if r.get("id") != item_id]
+        write_inventory(rows, custom)
+        log_history("delete_item",
+                    f"{target.get('category_path','')}/{target.get('name','')}",
+                    f"id={item_id}")
+        return jsonify({"ok": True})
+
+
+@APP.route("/api/item/move", methods=["POST"])
+def api_item_move():
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        item_id = data.get("id")
+        new_cat = (data.get("category_path") or "").strip()
+        rows, custom = read_inventory()
+        target = None
+        for r in rows:
+            if r.get("id") == item_id:
+                target = r
+                break
+        if not target:
+            return jsonify({"error": "Item not found."}), 404
+        old_cat = target.get("category_path", "")
+        target["category_path"] = new_cat
+        target["last_modified"] = now_str()
+        write_inventory(rows, custom)
+        log_history("move_item", f"{new_cat}/{target.get('name','')}",
+                    f"from '{old_cat}' to '{new_cat}'")
+        return jsonify({"ok": True})
+
+
+@APP.route("/api/category", methods=["POST"])
+def api_category_add():
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        parent = (data.get("parent") or "").strip()
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "Category name is required."}), 400
+        if "/" in name:
+            return jsonify({"error": "Category name cannot contain '/'."}), 400
+        path = f"{parent}/{name}" if parent else name
+        cat_map = read_categories()
+        if path in cat_map:
+            return jsonify({"error": "Category already exists."}), 400
+        cat_map[path] = []
+        write_categories(cat_map)
+        log_history("add_category", path, f"parent='{parent}'")
+        return jsonify({"ok": True})
+
+
+@APP.route("/api/category/rename", methods=["POST"])
+def api_category_rename():
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        old_path = (data.get("path") or "").strip()
+        new_name = (data.get("new_name") or "").strip()
+        if not old_path or not new_name:
+            return jsonify({"error": "Missing data."}), 400
+        if "/" in new_name:
+            return jsonify({"error": "Category name cannot contain '/'."}), 400
+
+        parts = old_path.split("/")
+        parent = "/".join(parts[:-1])
+        new_path = f"{parent}/{new_name}" if parent else new_name
+
+        # update categories
+        cat_map = read_categories()
+        new_map = {}
+        for p, req in cat_map.items():
+            if p == old_path or p.startswith(old_path + "/"):
+                np = new_path + p[len(old_path):]
+                new_map[np] = req
+            else:
+                new_map[p] = req
+        write_categories(new_map)
+
+        # update items
+        rows, custom = read_inventory()
+        for r in rows:
+            p = r.get("category_path", "")
+            if p == old_path or p.startswith(old_path + "/"):
+                r["category_path"] = new_path + p[len(old_path):]
+                r["last_modified"] = now_str()
+        write_inventory(rows, custom)
+        log_history("rename_category", old_path, f"-> {new_path}")
+        return jsonify({"ok": True, "new_path": new_path})
+
+
+@APP.route("/api/category/delete", methods=["POST"])
+def api_category_delete():
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        path = (data.get("path") or "").strip()
+        mode = data.get("mode", "block")  # block | items_only | recursive
+        if not path:
+            return jsonify({"error": "Missing category."}), 400
+
+        rows, custom = read_inventory()
+        affected = [
+            r for r in rows
+            if r.get("category_path", "") == path
+            or r.get("category_path", "").startswith(path + "/")
+        ]
+
+        if affected and mode == "block":
+            return jsonify(
+                {"error": "not_empty", "count": len(affected)}
+            ), 409
+
+        if mode == "recursive":
+            affected_ids = {r.get("id") for r in affected}
+            rows = [r for r in rows if r.get("id") not in affected_ids]
+            write_inventory(rows, custom)
+
+        # remove category + descendants from categories.csv
+        cat_map = read_categories()
+        cat_map = {
+            p: v for p, v in cat_map.items()
+            if not (p == path or p.startswith(path + "/"))
+        }
+        write_categories(cat_map)
+        log_history("delete_category", path, f"mode={mode}, items={len(affected)}")
+        return jsonify({"ok": True})
+
+
+@APP.route("/api/category/required", methods=["POST"])
+def api_category_required():
+    """Set the required custom fields for a category (auto-applied to new items)."""
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        path = (data.get("path") or "").strip()
+        fields = data.get("fields", [])
+        fields = [sanitize_field_name(f) for f in fields if f.strip()]
+        cat_map = read_categories()
+        cat_map[path] = fields
+        write_categories(cat_map)
+
+        # make sure these columns exist in inventory header
+        rows, custom = read_inventory()
+        changed = False
+        for f in fields:
+            if f not in BASE_COLUMNS and f not in custom:
+                custom.append(f)
+                changed = True
+        if changed:
+            write_inventory(rows, custom)
+        log_history("set_required_fields", path, ", ".join(fields))
+        return jsonify({"ok": True, "required_fields": fields})
+
+
+@APP.route("/api/required_for")
+def api_required_for():
+    with LOCK:
+        ensure_files()
+        cat = request.args.get("category", "").strip()
+        return jsonify({"required_fields": inherited_required_fields(cat)})
+
+
+@APP.route("/api/history")
+def api_history():
+    with LOCK:
+        ensure_files()
+        return jsonify({"history": read_history()})
+
+
+@APP.route("/api/browse_dir", methods=["POST"])
+def api_browse_dir():
+    """Open the OS folder picker on the server machine and return the choice."""
+    path = pick_directory_native()
+    if not path:
+        return jsonify({"cancelled": True})
+    return jsonify({"path": path})
+
+
+@APP.route("/api/import_file", methods=["POST"])
+def api_import_file():
+    """Pick a spreadsheet with the OS dialog and import it (sheets -> subcategories)."""
+    data = request.get_json(silent=True) or {}
+    path = (data.get("path") or "").strip()
+    if not path:
+        path = pick_file_native()
+    if not path:
+        return jsonify({"cancelled": True})
+    with LOCK:
+        try:
+            import import_data  # imported lazily: import_data imports this module
+            count = import_data.import_file(path)
+        except SystemExit as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            return jsonify({"error": f"Import failed: {e}"}), 400
+    return jsonify({"ok": True, "imported": count, "file": Path(path).name})
+
+
+@APP.route("/api/set_dir", methods=["POST"])
+def api_set_dir():
+    with LOCK:
+        data = request.get_json(force=True)
+        raw = (data.get("path") or "").strip()
+        if not raw:
+            return jsonify({"error": "Path is required."}), 400
+        try:
+            p = Path(raw).expanduser()
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return jsonify({"error": f"Could not use that folder: {e}"}), 400
+
+        old_dir = get_data_dir()
+        migrated = False
+        # If we're switching to a fresh, empty folder but already have data,
+        # copy the CSVs across so the data "moves" with your choice (never deletes source).
+        try:
+            switching = p.resolve() != old_dir.resolve()
+        except Exception:
+            switching = True
+        if switching and not (p / INVENTORY_CSV).exists() and (old_dir / INVENTORY_CSV).exists():
+            try:
+                for name in (INVENTORY_CSV, CATEGORIES_CSV, HISTORY_CSV):
+                    src = old_dir / name
+                    if src.exists():
+                        shutil.copy2(src, p / name)
+                migrated = True
+            except Exception:
+                migrated = False
+
+        set_data_dir(p)
+        ensure_files()
+        return jsonify({"ok": True, "data_dir": str(p), "migrated": migrated})
+
+
+@APP.route("/")
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+
+# ----------------------------------------------------------------------------
+# Front-end (single-page, embedded)
+# ----------------------------------------------------------------------------
+
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inventory Manager</title>
+<style>
+  :root{
+    --bg:#0f1419;
+    --panel:#171d26;
+    --panel-2:#1e2530;
+    --line:#2a3341;
+    --text:#e6ebf1;
+    --muted:#8b98a9;
+    --accent:#4c9be8;
+    --accent-soft:#22344a;
+    --danger:#e5646e;
+    --ok:#5bbf8f;
+    --on-accent:#06121f;   /* text color on top of --accent */
+    --radius:8px;
+    font-size:15px;
+  }
+  :root[data-theme="light"]{
+    --bg:#f4f6f9;
+    --panel:#ffffff;
+    --panel-2:#eceff4;
+    --line:#d7dde5;
+    --text:#1b2431;
+    --muted:#5f6b7c;
+    --accent:#2f7fd1;
+    --accent-soft:#dcebfb;
+    --danger:#d1454f;
+    --ok:#2e9c6d;
+    --on-accent:#ffffff;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;font-family:"Segoe UI",system-ui,-apple-system,sans-serif;
+    background:var(--bg);color:var(--text);height:100vh;overflow:hidden;
+  }
+  button{font-family:inherit;cursor:pointer;}
+  .app{display:flex;flex-direction:column;height:100vh;}
+
+  header{
+    display:flex;align-items:center;gap:14px;padding:10px 18px;
+    background:var(--panel);border-bottom:1px solid var(--line);
+  }
+  header h1{font-size:16px;font-weight:600;margin:0;letter-spacing:.2px;}
+  header .path{font-size:12px;color:var(--muted);margin-left:2px;}
+  header .spacer{flex:1;}
+  .btn{
+    background:var(--panel-2);border:1px solid var(--line);color:var(--text);
+    padding:7px 12px;border-radius:6px;font-size:13px;transition:.12s;
+  }
+  .btn:hover{border-color:var(--accent);}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600;}
+  .btn.primary:hover{filter:brightness(1.08);}
+  .btn.ghost{background:transparent;}
+  .btn.danger{color:var(--danger);border-color:transparent;background:transparent;}
+  .btn.danger:hover{border-color:var(--danger);}
+  .btn.small{padding:4px 8px;font-size:12px;}
+
+  main{display:flex;flex:1;min-height:0;}
+  .sidebar{
+    width:320px;min-width:220px;max-width:520px;background:var(--panel);
+    border-right:1px solid var(--line);display:flex;flex-direction:column;
+  }
+  .sidebar .head{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:12px 14px 8px;border-bottom:1px solid var(--line);
+  }
+  .sidebar .head span{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);}
+  .tree{flex:1;overflow:auto;padding:6px;}
+  .content{flex:1;display:flex;flex-direction:column;min-width:0;}
+
+  .node{user-select:none;}
+  .node-row{
+    display:flex;align-items:center;gap:4px;padding:5px 6px;border-radius:6px;
+    font-size:14px;white-space:nowrap;
+  }
+  .node-row:hover{background:var(--panel-2);}
+  .node-row.selected{background:var(--accent-soft);}
+  .twist{
+    width:16px;text-align:center;color:var(--muted);font-size:11px;
+    flex:0 0 16px;cursor:pointer;
+  }
+  .twist.empty{visibility:hidden;}
+  .node-name{flex:1;overflow:hidden;text-overflow:ellipsis;}
+  .node-count{color:var(--muted);font-size:12px;margin-left:6px;}
+  .node-actions{display:none;gap:2px;}
+  .node-row:hover .node-actions{display:flex;}
+  .icon-btn{
+    background:transparent;border:none;color:var(--muted);padding:2px 5px;
+    border-radius:4px;font-size:13px;line-height:1;
+  }
+  .icon-btn:hover{background:var(--line);color:var(--text);}
+  .children{margin-left:14px;border-left:1px solid var(--line);}
+
+  .toolbar{
+    display:flex;align-items:center;gap:10px;padding:12px 18px;
+    border-bottom:1px solid var(--line);background:var(--panel);
+  }
+  .toolbar h2{font-size:15px;margin:0;font-weight:600;}
+  .toolbar .crumb{color:var(--muted);font-weight:400;}
+  .search{
+    background:var(--bg);border:1px solid var(--line);color:var(--text);
+    padding:7px 10px;border-radius:6px;font-size:13px;width:220px;
+  }
+  .search:focus{outline:none;border-color:var(--accent);}
+  label.check{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;}
+
+  .table-wrap{flex:1;overflow:auto;}
+  table{border-collapse:collapse;width:100%;font-size:13px;}
+  th,td{
+    text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);
+    white-space:nowrap;max-width:320px;overflow:hidden;text-overflow:ellipsis;
+  }
+  th{
+    position:sticky;top:0;background:var(--panel-2);color:var(--muted);
+    font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;z-index:1;
+  }
+  tbody tr{cursor:pointer;}
+  tbody tr:hover{background:var(--panel-2);}
+  .empty-state{padding:60px 20px;text-align:center;color:var(--muted);}
+  .empty-state h3{color:var(--text);font-weight:600;margin:0 0 6px;}
+
+  /* modal */
+  .overlay{
+    position:fixed;inset:0;background:rgba(4,8,12,.6);display:none;
+    align-items:center;justify-content:center;z-index:50;padding:20px;
+  }
+  .overlay.show{display:flex;}
+  .modal{
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    width:100%;max-width:560px;max-height:88vh;overflow:auto;
+    box-shadow:0 24px 60px rgba(0,0,0,.5);
+  }
+  .modal .m-head{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:16px 20px;border-bottom:1px solid var(--line);
+  }
+  .modal .m-head h3{margin:0;font-size:15px;}
+  .modal .m-body{padding:18px 20px;}
+  .modal .m-foot{
+    display:flex;justify-content:flex-end;gap:10px;padding:14px 20px;
+    border-top:1px solid var(--line);
+  }
+  .field{margin-bottom:14px;}
+  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;}
+  .field input,.field select,.field textarea{
+    width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);
+    padding:8px 10px;border-radius:6px;font-size:14px;font-family:inherit;
+  }
+  .field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:var(--accent);}
+  .field .req{color:var(--accent);}
+  .custom-row{display:flex;gap:8px;align-items:flex-end;margin-bottom:10px;}
+  .custom-row .field{flex:1;margin-bottom:0;}
+  .muted{color:var(--muted);font-size:12px;}
+  .chip{
+    display:inline-flex;align-items:center;gap:6px;background:var(--accent-soft);
+    color:var(--text);padding:4px 8px;border-radius:20px;font-size:12px;margin:0 6px 6px 0;
+  }
+  .chip button{background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;}
+  .hist-item{
+    display:grid;grid-template-columns:150px 120px 1fr;gap:10px;padding:8px 4px;
+    border-bottom:1px solid var(--line);font-size:12px;
+  }
+  .hist-item .ts{color:var(--muted);}
+  .hist-item .act{color:var(--accent);}
+  .toast{
+    position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+    background:var(--panel-2);border:1px solid var(--line);color:var(--text);
+    padding:10px 18px;border-radius:8px;font-size:13px;opacity:0;transition:.25s;
+    pointer-events:none;z-index:100;
+  }
+  .toast.show{opacity:1;}
+  .toast.ok{border-color:var(--ok);}
+  .toast.err{border-color:var(--danger);}
+  ::-webkit-scrollbar{width:10px;height:10px;}
+  ::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Inventory Manager</h1>
+    <span class="path" id="dataPath"></span>
+    <span class="spacer"></span>
+    <button class="btn ghost small" id="themeToggle" onclick="toggleTheme()" title="Toggle light / dark">🌙</button>
+    <button class="btn ghost small" onclick="importFile()" title="Import a .csv / .xlsx file — each sheet becomes a subcategory">Import file</button>
+    <button class="btn ghost small" onclick="openHistory()">History</button>
+    <button class="btn ghost small" onclick="openDirModal()">Data folder</button>
+    <button class="btn primary small" onclick="openItemModal()">+ Item</button>
+  </header>
+
+  <main>
+    <aside class="sidebar">
+      <div class="head">
+        <span>Categories</span>
+        <button class="icon-btn" title="Add top-level category" onclick="addCategory('')">＋</button>
+      </div>
+      <div class="tree" id="tree"></div>
+    </aside>
+
+    <section class="content">
+      <div class="toolbar">
+        <h2 id="crumb"><span class="crumb">All items</span></h2>
+        <span class="spacer" style="flex:1"></span>
+        <label class="check"><input type="checkbox" id="includeSub" onchange="loadItems()"> include subcategories</label>
+        <input class="search" id="search" placeholder="Search…" oninput="debouncedLoad()">
+      </div>
+      <div class="table-wrap" id="tableWrap"></div>
+    </section>
+  </main>
+</div>
+
+<div class="overlay" id="overlay"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+// ---------- theme (light / dark) ----------
+function applyTheme(t){
+  document.documentElement.setAttribute("data-theme", t);
+  try{ localStorage.setItem("inv_theme", t); }catch(e){}
+  const b=document.getElementById("themeToggle");
+  if(b) b.textContent = (t==="light") ? "☀️" : "🌙";
+}
+function toggleTheme(){
+  const cur=document.documentElement.getAttribute("data-theme")||"dark";
+  applyTheme(cur==="light" ? "dark" : "light");
+}
+applyTheme((function(){ try{ return localStorage.getItem("inv_theme"); }catch(e){ return null; } })() || "dark");
+
+let STATE = {tree:[], custom_fields:[], data_dir:"", item_count:0};
+let SELECTED = "";           // selected category path ("" = all)
+let EXPANDED = new Set();
+let SEARCH_TIMER = null;
+
+// ---------- helpers ----------
+function toast(msg, kind="ok"){
+  const t=$("#toast"); t.textContent=msg; t.className="toast show "+kind;
+  setTimeout(()=>t.className="toast",1900);
+}
+async function api(url, opts){
+  const r = await fetch(url, opts);
+  const data = await r.json().catch(()=>({}));
+  if(!r.ok){ throw data; }
+  return data;
+}
+function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+// ---------- state / tree ----------
+async function loadState(){
+  STATE = await api("/api/state");
+  $("#dataPath").textContent = "· " + STATE.data_dir;
+  renderTree();
+  loadItems();
+}
+
+function renderTree(){
+  const el=$("#tree"); el.innerHTML="";
+  const allRow=document.createElement("div");
+  allRow.className="node-row"+(SELECTED===""?" selected":"");
+  allRow.innerHTML=`<span class="twist empty"></span><span class="node-name">All items</span><span class="node-count">${STATE.item_count}</span>`;
+  allRow.onclick=()=>{SELECTED="";renderTree();loadItems();};
+  el.appendChild(allRow);
+  STATE.tree.forEach(n=>el.appendChild(renderNode(n)));
+}
+
+function renderNode(node){
+  const wrap=document.createElement("div"); wrap.className="node";
+  const row=document.createElement("div");
+  row.className="node-row"+(SELECTED===node.path?" selected":"");
+  const hasKids=node.children.length>0;
+  const open=EXPANDED.has(node.path);
+  row.innerHTML=`
+    <span class="twist ${hasKids?'':'empty'}">${hasKids?(open?'▾':'▸'):''}</span>
+    <span class="node-name" title="${esc(node.path)}">${esc(node.name)}</span>
+    <span class="node-count">${node.count}</span>
+    <span class="node-actions">
+      <button class="icon-btn" title="Add subcategory">＋</button>
+      <button class="icon-btn" title="Required fields">⚙</button>
+      <button class="icon-btn" title="Rename">✎</button>
+      <button class="icon-btn" title="Delete">🗑</button>
+    </span>`;
+  const [addBtn,reqBtn,renBtn,delBtn]=row.querySelectorAll(".node-actions .icon-btn");
+  const twist=row.querySelector(".twist");
+  twist.onclick=e=>{e.stopPropagation(); if(!hasKids)return; open?EXPANDED.delete(node.path):EXPANDED.add(node.path); renderTree();};
+  row.onclick=()=>{SELECTED=node.path;renderTree();loadItems();};
+  addBtn.onclick=e=>{e.stopPropagation();addCategory(node.path);};
+  reqBtn.onclick=e=>{e.stopPropagation();openRequiredModal(node);};
+  renBtn.onclick=e=>{e.stopPropagation();renameCategory(node);};
+  delBtn.onclick=e=>{e.stopPropagation();deleteCategory(node);};
+  wrap.appendChild(row);
+  if(hasKids&&open){
+    const kids=document.createElement("div"); kids.className="children";
+    node.children.forEach(c=>kids.appendChild(renderNode(c)));
+    wrap.appendChild(kids);
+  }
+  return wrap;
+}
+
+// ---------- items ----------
+function debouncedLoad(){clearTimeout(SEARCH_TIMER);SEARCH_TIMER=setTimeout(loadItems,220);}
+
+async function loadItems(){
+  const cat=SELECTED, sub=$("#includeSub").checked?"1":"0";
+  const search=encodeURIComponent($("#search").value.trim());
+  const crumb = cat ? cat.split("/").map(esc).join(" › ") : "All items";
+  $("#crumb").innerHTML = `<span class="crumb">${crumb}</span>`;
+  const data = await api(`/api/items?category=${encodeURIComponent(cat)}&include_sub=${sub}&search=${search}`);
+  renderTable(data.items, data.custom_fields);
+}
+
+function renderTable(items, customFields){
+  const wrap=$("#tableWrap");
+  if(!items.length){
+    wrap.innerHTML=`<div class="empty-state"><h3>No items here</h3>
+      <p>Add an item to this category, or pick another category.</p>
+      <button class="btn primary" onclick="openItemModal()">+ Add item</button></div>`;
+    return;
+  }
+  // columns that actually have data in this view
+  const usedCustom = customFields.filter(f=>items.some(it=>(it[f]||"").trim()!==""));
+  const cols=["name","quantity","category_path",...usedCustom,"date_added","last_modified"];
+  const labels={name:"Name",quantity:"Qty",category_path:"Category",date_added:"Added",last_modified:"Modified"};
+  let html="<table><thead><tr>";
+  cols.forEach(c=>html+=`<th>${esc(labels[c]||c)}</th>`);
+  html+="<th></th></tr></thead><tbody>";
+  items.forEach(it=>{
+    html+=`<tr onclick='editItem(${JSON.stringify(it.id)})'>`;
+    cols.forEach(c=>html+=`<td title="${esc(it[c])}">${esc(it[c])}</td>`);
+    html+=`<td><button class="icon-btn" title="Move" onclick='event.stopPropagation();moveItem(${JSON.stringify(it.id)},${JSON.stringify(it.category_path)})'>⇄</button>
+           <button class="icon-btn" title="Delete" onclick='event.stopPropagation();deleteItem(${JSON.stringify(it.id)})'>🗑</button></td>`;
+    html+="</tr>";
+  });
+  html+="</tbody></table>";
+  wrap.innerHTML=html;
+}
+
+// ---------- modal infra ----------
+function showModal(node){const o=$("#overlay");o.innerHTML="";o.appendChild(node);o.classList.add("show");}
+function closeModal(){$("#overlay").classList.remove("show");$("#overlay").innerHTML="";}
+$("#overlay").addEventListener("click",e=>{if(e.target===$("#overlay"))closeModal();});
+
+function modalShell(title, bodyHtml, footHtml){
+  const m=document.createElement("div"); m.className="modal";
+  m.innerHTML=`<div class="m-head"><h3>${esc(title)}</h3><button class="icon-btn" onclick="closeModal()">✕</button></div>
+    <div class="m-body">${bodyHtml}</div><div class="m-foot">${footHtml}</div>`;
+  return m;
+}
+
+// ---------- categories ----------
+async function addCategory(parent){
+  const name=prompt(parent?`New subcategory under "${parent}":`:"New top-level category:");
+  if(!name) return;
+  try{ await api("/api/category",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({parent,name:name.trim()})});
+    if(parent)EXPANDED.add(parent);
+    toast("Category added"); loadState();
+  }catch(e){toast(e.error||"Failed","err");}
+}
+async function renameCategory(node){
+  const nn=prompt("Rename category:",node.name);
+  if(!nn||nn===node.name) return;
+  try{ await api("/api/category/rename",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({path:node.path,new_name:nn.trim()})});
+    toast("Renamed"); loadState();
+  }catch(e){toast(e.error||"Failed","err");}
+}
+async function deleteCategory(node){
+  try{
+    await api("/api/category/delete",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({path:node.path,mode:"block"})});
+    toast("Category deleted"); if(SELECTED===node.path)SELECTED=""; loadState();
+  }catch(e){
+    if(e.error==="not_empty"){
+      const go=confirm(`"${node.name}" and its subcategories contain ${e.count} item(s).\n\nOK = delete category AND all its items.\nCancel = keep everything.`);
+      if(!go) return;
+      try{
+        await api("/api/category/delete",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({path:node.path,mode:"recursive"})});
+        toast("Category and items deleted"); if(SELECTED===node.path)SELECTED=""; loadState();
+      }catch(e2){toast(e2.error||"Failed","err");}
+    }else{toast(e.error||"Failed","err");}
+  }
+}
+
+function openRequiredModal(node){
+  let fields=[...(node.required_fields||[])];
+  const body=`<p class="muted">New items created in <b>${esc(node.name)}</b> (and its subcategories) will automatically get these fields.</p>
+    <div id="reqChips" style="margin:12px 0;"></div>
+    <div class="custom-row">
+      <div class="field" style="margin:0"><label>Add a field name</label>
+        <input id="reqInput" placeholder="e.g. serial_number" onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('reqAddBtn').click();}"></div>
+      <button class="btn" id="reqAddBtn">Add</button>
+    </div>`;
+  const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" id="reqSave">Save</button>`;
+  const m=modalShell(`Required fields · ${node.name}`, body, foot);
+  showModal(m);
+  const renderChips=()=>{
+    m.querySelector("#reqChips").innerHTML = fields.length
+      ? fields.map((f,i)=>`<span class="chip">${esc(f)}<button data-i="${i}">✕</button></span>`).join("")
+      : `<span class="muted">No required fields yet.</span>`;
+    m.querySelectorAll("#reqChips .chip button").forEach(b=>b.onclick=()=>{fields.splice(+b.dataset.i,1);renderChips();});
+  };
+  renderChips();
+  m.querySelector("#reqAddBtn").onclick=()=>{
+    const v=m.querySelector("#reqInput").value.trim();
+    if(v&&!fields.includes(v)){fields.push(v);renderChips();}
+    m.querySelector("#reqInput").value="";m.querySelector("#reqInput").focus();
+  };
+  m.querySelector("#reqSave").onclick=async()=>{
+    try{await api("/api/category/required",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({path:node.path,fields})});
+      toast("Saved"); closeModal(); loadState();
+    }catch(e){toast(e.error||"Failed","err");}
+  };
+}
+
+// ---------- items ----------
+async function categoryOptions(selected){
+  // flatten tree paths
+  const paths=[];
+  (function walk(nodes){nodes.forEach(n=>{paths.push(n.path);walk(n.children);});})(STATE.tree);
+  return paths.map(p=>`<option value="${esc(p)}" ${p===selected?"selected":""}>${esc(p)}</option>`).join("");
+}
+
+async function openItemModal(){
+  await buildItemModal(null);
+}
+async function editItem(id){
+  const data=await api(`/api/items?category=&include_sub=1`);
+  const it=data.items.find(x=>x.id===id);
+  if(!it){toast("Not found","err");return;}
+  await buildItemModal(it);
+}
+
+async function buildItemModal(item){
+  const isEdit=!!item;
+  const startCat = item ? item.category_path : SELECTED;
+  const opts = await categoryOptions(startCat);
+  let customPairs=[];   // {key,value}
+  if(item){
+    STATE.custom_fields.forEach(f=>{ if((item[f]||"").trim()!=="") customPairs.push({key:f,value:item[f]}); });
+  }
+
+  const body=`
+    <div class="field"><label>Name <span class="req">*</span></label>
+      <input id="f_name" value="${item?esc(item.name):""}" placeholder="Item name"></div>
+    <div class="field"><label>Quantity</label>
+      <input id="f_qty" value="${item?esc(item.quantity):"1"}" type="text"></div>
+    <div class="field"><label>Category</label>
+      <select id="f_cat"><option value="">— none —</option>${opts}</select></div>
+    <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
+    <div class="muted" style="margin-bottom:8px;">Additional info — add any fields this item needs</div>
+    <div id="customFields"></div>
+    <div class="custom-row">
+      <div class="field" style="margin:0;flex:1.3"><label>Field name</label><input id="newFieldKey" placeholder="e.g. serial_number"></div>
+      <div class="field" style="margin:0;max-width:110px"><label>Type</label>
+        <select id="newFieldType">
+          <option value="text">Text</option>
+          <option value="number">Number</option>
+          <option value="date">Date</option>
+          <option value="notes">Notes</option>
+        </select></div>
+      <div class="field" style="margin:0;flex:1.3"><label>Value</label><input id="newFieldVal" placeholder="value"></div>
+      <button class="btn" id="addFieldBtn">Add</button>
+    </div>`;
+  const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" id="saveItem">${isEdit?"Save changes":"Add item"}</button>`;
+  const m=modalShell(isEdit?"Edit item":"New item", body, foot);
+  showModal(m);
+
+  const renderCustom=()=>{
+    const c=m.querySelector("#customFields");
+    c.innerHTML = customPairs.map((p,i)=>{
+      const val=p.value||"";
+      const multiline = /\n/.test(val) || val.length>60;
+      const control = multiline
+        ? `<textarea data-i="${i}" class="cv" rows="3">${esc(val)}</textarea>`
+        : `<input data-i="${i}" class="cv" value="${esc(val)}">`;
+      return `<div class="custom-row">
+        <div class="field" style="margin:0"><label>${esc(p.key)}</label>${control}</div>
+        <button class="btn danger small" data-del="${i}" title="Remove field">✕</button>
+      </div>`;
+    }).join("");
+    c.querySelectorAll(".cv").forEach(inp=>inp.oninput=()=>customPairs[+inp.dataset.i].value=inp.value);
+    c.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>{customPairs.splice(+b.dataset.del,1);renderCustom();});
+  };
+  renderCustom();
+
+  // swap the "value" input widget to match the chosen field type
+  m.querySelector("#newFieldType").onchange=e=>{
+    const old=m.querySelector("#newFieldVal");
+    const t=e.target.value;
+    let el;
+    if(t==="notes"){ el=document.createElement("textarea"); el.rows=3; }
+    else { el=document.createElement("input"); el.type = (t==="number")?"number":(t==="date")?"date":"text"; }
+    el.id="newFieldVal"; el.placeholder="value";
+    old.parentElement.replaceChild(el, old);
+  };
+
+  m.querySelector("#addFieldBtn").onclick=()=>{
+    const k=m.querySelector("#newFieldKey").value.trim();
+    const v=m.querySelector("#newFieldVal").value;
+    if(!k)return;
+    if(customPairs.some(p=>p.key===k)){toast("Field already added","err");return;}
+    customPairs.push({key:k,value:v});
+    m.querySelector("#newFieldKey").value="";m.querySelector("#newFieldVal").value="";
+    renderCustom();
+  };
+
+  // auto-apply required fields when category changes
+  const applyRequired=async(cat)=>{
+    if(!cat)return;
+    const r=await api(`/api/required_for?category=${encodeURIComponent(cat)}`);
+    (r.required_fields||[]).forEach(f=>{
+      if(!customPairs.some(p=>p.key===f)) customPairs.push({key:f,value:""});
+    });
+    renderCustom();
+  };
+  m.querySelector("#f_cat").onchange=e=>applyRequired(e.target.value);
+  if(!isEdit && startCat) applyRequired(startCat);
+
+  m.querySelector("#saveItem").onclick=async()=>{
+    const fields={
+      name:m.querySelector("#f_name").value.trim(),
+      quantity:m.querySelector("#f_qty").value.trim(),
+      category_path:m.querySelector("#f_cat").value
+    };
+    if(!fields.name){toast("Name is required","err");return;}
+    customPairs.forEach(p=>{ if(p.key.trim()) fields[p.key.trim()]=p.value; });
+    try{
+      await api("/api/item",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({id:item?item.id:"",fields})});
+      toast(isEdit?"Saved":"Item added"); closeModal(); loadState();
+    }catch(e){toast(e.error||"Failed","err");}
+  };
+}
+
+async function deleteItem(id){
+  if(!confirm("Delete this item?"))return;
+  try{await api("/api/item/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
+    toast("Item deleted"); loadState();
+  }catch(e){toast(e.error||"Failed","err");}
+}
+
+async function moveItem(id,current){
+  const opts=await categoryOptions(current);
+  const body=`<div class="field"><label>Move item to category</label>
+    <select id="moveCat"><option value="">— none —</option>${opts}</select></div>`;
+  const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" id="doMove">Move</button>`;
+  const m=modalShell("Move item", body, foot); showModal(m);
+  m.querySelector("#doMove").onclick=async()=>{
+    const cat=m.querySelector("#moveCat").value;
+    try{await api("/api/item/move",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id,category_path:cat})});
+      toast("Moved"); closeModal(); loadState();
+    }catch(e){toast(e.error||"Failed","err");}
+  };
+}
+
+// ---------- import ----------
+async function importFile(){
+  toast("Choose a file in the dialog…");
+  try{
+    const r=await api("/api/import_file",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    if(r.cancelled) return;
+    toast(`Imported ${r.imported} item(s) from ${r.file}`);
+    loadState();
+  }catch(e){ toast(e.error||"Import failed","err"); }
+}
+
+// ---------- history ----------
+async function openHistory(){
+  const data=await api("/api/history");
+  const rows=data.history||[];
+  const body = rows.length
+    ? `<div>${rows.map(h=>`<div class="hist-item">
+        <span class="ts">${esc(h.timestamp)}</span>
+        <span class="act">${esc(h.action)}</span>
+        <span>${esc(h.target)}${h.detail?` — <span class="muted">${esc(h.detail)}</span>`:""}</span></div>`).join("")}</div>`
+    : `<p class="muted">No changes recorded yet.</p>`;
+  const m=modalShell("Change history", body, `<button class="btn primary" onclick="closeModal()">Close</button>`);
+  m.style.maxWidth="720px";
+  showModal(m);
+}
+
+// ---------- data dir ----------
+function openDirModal(){
+  const canBrowse = STATE.can_browse;
+  const body=`<div class="field"><label>Folder for CSV data (e.g. your shared drive)</label>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <input id="dirInput" style="flex:1;min-width:0" value="${esc(STATE.data_dir)}" placeholder="/path/to/folder or \\\\server\\share\\inventory">
+      ${canBrowse?`<button class="btn" id="browseBtn" type="button" style="white-space:nowrap;">Browse…</button>`:``}
+    </div></div>
+    <p class="muted">Files stored here: inventory.csv, categories.csv, history.csv — all openable in Excel.
+    Pick an empty folder and your current data is copied there automatically.</p>`;
+  const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" id="saveDir">Use this folder</button>`;
+  const m=modalShell("Data folder", body, foot); showModal(m);
+  if(canBrowse){
+    m.querySelector("#browseBtn").onclick=async()=>{
+      const btn=m.querySelector("#browseBtn"), old=btn.textContent;
+      btn.textContent="Opening…"; btn.disabled=true;
+      try{
+        const r=await api("/api/browse_dir",{method:"POST"});
+        if(r.path) m.querySelector("#dirInput").value=r.path;
+      }catch(e){ toast("Could not open folder picker","err"); }
+      btn.textContent=old; btn.disabled=false;
+    };
+  }
+  m.querySelector("#saveDir").onclick=async()=>{
+    const path=m.querySelector("#dirInput").value.trim();
+    try{const r=await api("/api/set_dir",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path})});
+      toast(r.migrated?"Data folder set · existing data copied":"Data folder set"); closeModal(); loadState();
+    }catch(e){toast(e.error||"Failed","err");}
+  };
+}
+
+loadState();
+</script>
+</body>
+</html>
+"""
+
+
+def _open_browser(url):
+    """Open the default web browser a moment after the server starts."""
+    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+
+
+if __name__ == "__main__":
+    ensure_files()
+    HOST = "127.0.0.1"
+    # NOTE: not 5000 — on macOS the AirPlay Receiver (Control Center) permanently
+    # occupies port 5000, so binding there fails with "address already in use".
+    PORT = int(os.environ.get("INVENTORY_PORT", "8765"))
+    url = f"http://{HOST}:{PORT}"
+
+    print("=" * 60)
+    print("  Department Inventory Manager")
+    print("=" * 60)
+    print(f"  Data folder : {get_data_dir()}")
+    print(f"  Open in your browser: {url}")
+    print("  (Press Ctrl+C to stop)")
+    print("=" * 60)
+
+    # Flask's dev server would spawn a second process with the reloader and
+    # open the browser twice; the reloader is already off (debug=False).
+    _open_browser(url)
+    try:
+        APP.run(host=HOST, port=PORT, debug=False)
+    except OSError as e:
+        sys.stderr.write(
+            f"\n[Inventory Manager] Could not start on {url}: {e}\n"
+            "The port may already be in use (is the app already running?).\n"
+            "Set a different port with the INVENTORY_PORT environment variable.\n\n"
+        )
+        sys.exit(1)

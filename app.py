@@ -32,16 +32,32 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
+def fatal(message):
+    """
+    Report a startup failure and quit. Falls back to a dialog box when there is
+    no console to print to (Windows pythonw.exe sets sys.stderr to None).
+    """
+    if sys.stderr is not None:
+        sys.stderr.write("\n[Inventory Manager] " + message + "\n\n")
+    elif os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                None, message, "Inventory Manager", 0x10)
+        except Exception:
+            pass
+    sys.exit(1)
+
+
 try:
     from flask import Flask, request, jsonify, Response
 except ModuleNotFoundError:
-    sys.stderr.write(
-        "\n[Inventory Manager] Flask is not installed.\n"
-        "Install it with:\n\n"
-        "    python3 -m pip install flask\n\n"
-        "then run this program again.\n\n"
+    fatal(
+        "Flask is not installed.\n\nInstall it with:\n\n"
+        "    python -m pip install flask\n\n"
+        "(use python3 instead of python on macOS/Linux), "
+        "then run this program again."
     )
-    sys.exit(1)
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -118,6 +134,16 @@ def paths():
 # Native "choose folder" dialog (the server runs on the same machine as the UI)
 # ----------------------------------------------------------------------------
 
+# Keeps a console window from flashing up when we shell out on Windows.
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def run_hidden(cmd, timeout=300):
+    """Run a helper command without popping up a console window."""
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=timeout, creationflags=NO_WINDOW)
+
+
 def native_picker_available():
     """True if this machine has an OS folder-picker we know how to invoke."""
     if sys.platform == "darwin":
@@ -136,8 +162,7 @@ def pick_directory_native():
         if sys.platform == "darwin":
             script = ('POSIX path of (choose folder with prompt '
                       '"Choose a folder for your inventory data")')
-            r = subprocess.run(["osascript", "-e", script],
-                               capture_output=True, text=True, timeout=300)
+            r = run_hidden(["osascript", "-e", script])
             return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
         if os.name == "nt":
@@ -146,8 +171,8 @@ def pick_directory_native():
                 "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
                 "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }"
             )
-            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                               capture_output=True, text=True, timeout=300)
+            r = run_hidden(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                            "-Command", ps])
             return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
         # Linux
@@ -155,7 +180,7 @@ def pick_directory_native():
                      "--title=Choose a folder for your inventory data"],
                     ["kdialog", "--getexistingdirectory", str(Path.home())]):
             if shutil.which(cmd[0]):
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                r = run_hidden(cmd)
                 return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
         return None
     except Exception:
@@ -169,8 +194,7 @@ def pick_file_native():
             script = ('POSIX path of (choose file with prompt '
                       '"Choose a spreadsheet to import" of type '
                       '{"csv","xlsx","xlsm","tsv","txt"})')
-            r = subprocess.run(["osascript", "-e", script],
-                               capture_output=True, text=True, timeout=300)
+            r = run_hidden(["osascript", "-e", script])
             return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
         if os.name == "nt":
@@ -180,15 +204,15 @@ def pick_file_native():
                 "$f.Filter = 'Spreadsheets|*.csv;*.xlsx;*.xlsm;*.tsv;*.txt|All files|*.*'; "
                 "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }"
             )
-            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                               capture_output=True, text=True, timeout=300)
+            r = run_hidden(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                            "-Command", ps])
             return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
         for cmd in (["zenity", "--file-selection",
                      "--title=Choose a spreadsheet to import"],
                     ["kdialog", "--getopenfilename", str(Path.home())]):
             if shutil.which(cmd[0]):
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                r = run_hidden(cmd)
                 return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
         return None
     except Exception:
@@ -1547,9 +1571,8 @@ if __name__ == "__main__":
     try:
         APP.run(host=HOST, port=PORT, debug=False)
     except OSError as e:
-        sys.stderr.write(
-            f"\n[Inventory Manager] Could not start on {url}: {e}\n"
+        fatal(
+            f"Could not start on {url}: {e}\n\n"
             "The port may already be in use (is the app already running?).\n"
-            "Set a different port with the INVENTORY_PORT environment variable.\n\n"
+            "Set a different port with the INVENTORY_PORT environment variable."
         )
-        sys.exit(1)

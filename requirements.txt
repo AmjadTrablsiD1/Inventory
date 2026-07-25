@@ -1,0 +1,7 @@
+# Inventory Manager dependencies
+#   pip install -r requirements.txt
+
+flask>=2.0
+
+# Only needed to import .xlsx / .xlsm files. Plain .csv import works without it.
+openpyxl>=3.0

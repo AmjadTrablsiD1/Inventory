@@ -256,19 +256,14 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False):
 
 
 def pick_file_dialog():
-    """Ask the OS for a file when the script is run with no arguments."""
+    """Ask the OS for a file when the script is run with no arguments.
+
+    Uses the app's picker, which supports macOS, Windows and Linux.
+    """
     try:
-        import subprocess
-        if sys.platform == "darwin":
-            script = ('POSIX path of (choose file with prompt '
-                      '"Choose a spreadsheet to import" of type '
-                      '{"csv","xlsx","xlsm","tsv","txt"})')
-            r = subprocess.run(["osascript", "-e", script],
-                               capture_output=True, text=True)
-            return r.stdout.strip() or None
+        return inv.pick_file_native()
     except Exception:
-        pass
-    return None
+        return None
 
 
 def main():

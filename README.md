@@ -34,37 +34,50 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 
 ---
 
+Runs on **Windows, macOS and Linux**.
+
 ## Requirements
 
 - **Python 3.8+** (developed on 3.13)
-- **Flask** — `pip install flask`
-- **openpyxl** — only needed to import `.xlsx` files: `pip install openpyxl`
+- **Flask** — the launchers install it for you on first run
 
 ```bash
-python3 -m pip install flask openpyxl
+pip install -r requirements.txt
 ```
+
+`openpyxl` is only needed to import `.xlsx` files; plain `.csv` import works without it.
+
+> On Windows, install Python from [python.org](https://www.python.org/downloads/) and tick **"Add Python to PATH"** during setup.
 
 ---
 
 ## Running it
 
-**Option 1 — double-click launcher (macOS, no Terminal window)**
+### Windows
+
+Double-click **`Inventory Manager.vbs`**. It starts the app with **no console window**, installs Flask on first run if needed, and opens your browser. Double-clicking it again while it's running just reopens the browser instead of starting a second copy.
+
+If you'd rather see the output — or if your workplace blocks `.vbs` scripts — double-click **`run.bat`** instead. It does the same thing but keeps a console window open, which makes troubleshooting easier.
+
+To put it in your Start menu or on the desktop: right-click `Inventory Manager.vbs` → **Send to** → **Desktop (create shortcut)**.
+
+### macOS
 
 ```bash
 ./build_launcher.sh
 ```
 
-That produces `Inventory Manager.app` next to `app.py`. Double-click it: it starts the server in the background, installs Flask if missing, and opens your browser. Clicking it again while it's running just reopens the browser instead of starting a second copy.
+That produces `Inventory Manager.app` next to `app.py`. Double-click it: it starts the server in the background, installs Flask if missing, and opens your browser.
 
 > macOS may show an "unidentified developer" warning the first time, because the app is built locally rather than signed. Right-click → **Open** once to approve it.
 
-**Option 2 — from the terminal**
+### Any platform — from the terminal
 
 ```bash
-python3 app.py
+python app.py
 ```
 
-Then open <http://127.0.0.1:8765> (it opens automatically).
+(use `python3` on macOS/Linux). Then open <http://127.0.0.1:8765> — it opens automatically.
 
 > **Note on the port:** the default is **8765**, not the usual 5000, because on modern macOS the AirPlay Receiver permanently occupies port 5000.
 
@@ -183,18 +196,31 @@ Do not change the host to `0.0.0.0` or put it on a public network. It exposes en
 
 - The **field type** (Text/Number/Date/Notes) chooses the right input widget while you type, but isn't stored — CSV holds plain text, so a date is saved as `2027-01-31`.
 - Only one person should write at a time. There's no record locking, so two people saving simultaneously against the same shared folder can overwrite each other.
-- The launcher script is macOS-only. On Windows and Linux, run `python3 app.py` (the folder and file pickers work on all three platforms).
+- Linux has no double-click launcher — run `python3 app.py`. The folder and file pickers work on all three platforms (Linux needs `zenity` or `kdialog` installed for them).
 
 ---
 
 ## Project structure
 
 ```
-app.py                  # the web app: server, API, and embedded single-page UI
-import_data.py          # standalone spreadsheet importer (also used by the app)
-launcher.applescript    # source for the macOS no-console launcher
-build_launcher.sh       # builds Inventory Manager.app from the above
+app.py                    # the web app: server, API, and embedded single-page UI
+import_data.py            # standalone spreadsheet importer (also used by the app)
+requirements.txt          # Python dependencies
+
+Inventory Manager.vbs     # Windows: double-click launcher, no console window
+run.bat                   # Windows: same, but with a visible console for troubleshooting
+
+launcher.applescript      # macOS: source for the no-console launcher
+build_launcher.sh         # macOS: builds "Inventory Manager.app" from the above
 ```
+
+### Platform notes
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| Double-click launcher | `Inventory Manager.vbs` | build with `build_launcher.sh` | — |
+| Folder / file pickers | PowerShell | AppleScript | zenity or kdialog |
+| Runs windowless | `pythonw.exe` | background process | — |
 
 `Inventory Manager.app` is a build artifact and is not committed — run `./build_launcher.sh` to produce it. Your inventory CSVs are never committed either; they live outside the repo (`~/InventoryData` by default).
 

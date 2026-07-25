@@ -196,8 +196,10 @@ launcher.applescript    # source for the macOS no-console launcher
 build_launcher.sh       # builds Inventory Manager.app from the above
 ```
 
+`Inventory Manager.app` is a build artifact and is not committed — run `./build_launcher.sh` to produce it. Your inventory CSVs are never committed either; they live outside the repo (`~/InventoryData` by default).
+
 ---
 
 ## License
 
-No license has been chosen yet. Until one is added, default copyright applies and others may not reuse the code. If you want it to be freely reusable, add an MIT or Apache-2.0 `LICENSE` file.
+[MIT](LICENSE) — free to use, modify and distribute, with no warranty.

@@ -66,6 +66,16 @@ except ModuleNotFoundError:
 APP = Flask(__name__)
 LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
+# Bump this when you publish a new version. The updater compares it with the
+# APP_VERSION in the copy of app.py on GitHub.
+APP_VERSION = "1.1.0"
+
+# Where updates come from. Normally auto-detected from this checkout's git
+# remote; set INVENTORY_REPO ("owner/name") to override.
+DEFAULT_REPO = "AmjadTrablsiD1/Inventory"
+UPDATE_BRANCH = os.environ.get("INVENTORY_BRANCH", "main")
+APP_DIR = Path(__file__).resolve().parent
+
 # Where the CSVs live. Change this, set INVENTORY_DIR, or pick a folder in the UI.
 DEFAULT_DIR = os.environ.get(
     "INVENTORY_DIR",
@@ -546,6 +556,169 @@ def sanitize_field_name(name):
 
 
 # ----------------------------------------------------------------------------
+# Self-update from GitHub
+#
+# Only ever talks to the one repository configured below (auto-detected from
+# this checkout's git remote). Nothing is applied without an explicit request,
+# and every file that gets overwritten is backed up first.
+# ----------------------------------------------------------------------------
+
+# Files the updater is allowed to write. Anything else in the archive is ignored.
+UPDATABLE_SUFFIXES = {".py", ".md", ".txt", ".sh", ".bat", ".vbs",
+                      ".applescript", ".gitignore", ""}
+UPDATE_SKIP = {".git", ".github", "__pycache__", ".claude", ".DS_Store"}
+
+
+def github_repo():
+    """'owner/name' for the update source: env var, then git remote, then default."""
+    env = os.environ.get("INVENTORY_REPO", "").strip()
+    if env:
+        return env.replace("https://github.com/", "").rstrip("/").removesuffix(".git")
+    try:
+        r = run_hidden(["git", "-C", str(APP_DIR), "remote", "get-url", "origin"],
+                       timeout=10)
+        url = (r.stdout or "").strip()
+        if url:
+            m = re.search(r"github\.com[:/]+([^/]+/[^/\s]+?)(?:\.git)?$", url)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return DEFAULT_REPO
+
+
+def _gh_get(url, timeout=15, raw=False):
+    """GET from GitHub over HTTPS. Returns parsed JSON, bytes, or None."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"InventoryManager/{APP_VERSION}",
+        "Accept": "application/octet-stream" if raw else "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    return data if raw else json.loads(data.decode("utf-8"))
+
+
+def _version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:4]) or (0,)
+
+
+def check_for_update():
+    """Ask GitHub what the latest version is. Never raises."""
+    repo = github_repo()
+    info = {"repo": repo, "branch": UPDATE_BRANCH, "current": APP_VERSION,
+            "latest": None, "update_available": False, "commits": [], "error": None}
+    try:
+        # version string in the published app.py
+        raw_url = (f"https://raw.githubusercontent.com/{repo}/"
+                   f"{UPDATE_BRANCH}/app.py")
+        text = _gh_get(raw_url, raw=True).decode("utf-8", "replace")
+        m = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', text, re.M)
+        info["latest"] = m.group(1) if m else None
+
+        # recent commit subjects, so the user can see what they'd be getting
+        try:
+            commits = _gh_get(f"https://api.github.com/repos/{repo}/commits"
+                              f"?sha={UPDATE_BRANCH}&per_page=5")
+            info["commits"] = [
+                {"sha": c.get("sha", "")[:7],
+                 "message": (c.get("commit", {}).get("message") or "").split("\n")[0],
+                 "date": (c.get("commit", {}).get("author", {}) or {}).get("date", "")[:10]}
+                for c in commits if isinstance(c, dict)
+            ]
+        except Exception:
+            pass  # rate-limited or private: the version check alone is enough
+
+        if info["latest"]:
+            info["update_available"] = (
+                _version_tuple(info["latest"]) > _version_tuple(APP_VERSION))
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
+def apply_update():
+    """
+    Download the repo archive and replace the program files, backing up
+    everything it overwrites. Returns (ok, message, details).
+    """
+    import io
+    import zipfile
+    import tempfile
+
+    repo = github_repo()
+    url = f"https://api.github.com/repos/{repo}/zipball/{UPDATE_BRANCH}"
+    try:
+        blob = _gh_get(url, timeout=120, raw=True)
+    except Exception as e:
+        return False, f"Could not download the update: {e}", {}
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(blob))
+    except Exception as e:
+        return False, f"The downloaded file was not a valid archive: {e}", {}
+
+    names = zf.namelist()
+    if not names:
+        return False, "The downloaded archive was empty.", {}
+    root = names[0].split("/")[0]
+
+    # sanity check: refuse anything that isn't recognisably this project
+    if not any(n == f"{root}/app.py" for n in names):
+        return False, "The archive does not contain app.py - update aborted.", {}
+
+    staged = {}
+    for n in names:
+        rel = n[len(root) + 1:]
+        if not rel or n.endswith("/"):
+            continue
+        parts = Path(rel).parts
+        if any(p in UPDATE_SKIP for p in parts):
+            continue
+        if ".." in parts or Path(rel).is_absolute():
+            continue                                   # zip-slip guard
+        if Path(rel).suffix not in UPDATABLE_SUFFIXES:
+            continue
+        staged[rel] = zf.read(n)
+
+    if "app.py" not in staged:
+        return False, "app.py was missing from the archive - update aborted.", {}
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = APP_DIR / f"backup_before_update_{stamp}"
+    changed, added = [], []
+    try:
+        backup.mkdir(parents=True, exist_ok=True)
+        for rel, content in sorted(staged.items()):
+            target = APP_DIR / rel
+            if target.exists():
+                if target.read_bytes() == content:
+                    continue                            # identical, skip
+                dest = backup / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, dest)
+                changed.append(rel)
+            else:
+                added.append(rel)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+    except Exception as e:
+        return False, f"Update failed while writing files: {e}", {
+            "backup": str(backup), "changed": changed, "added": added}
+
+    if not changed and not added:
+        try:
+            backup.rmdir()
+        except Exception:
+            pass
+        return True, "Already up to date - no files needed changing.", {
+            "changed": [], "added": []}
+
+    return True, "Update installed.", {
+        "backup": str(backup), "changed": changed, "added": added}
+
+
+# ----------------------------------------------------------------------------
 # API routes
 # ----------------------------------------------------------------------------
 
@@ -564,6 +737,7 @@ def api_state():
                 "data_dir": d,
                 "item_count": len(rows),
                 "can_browse": native_picker_available(),
+                "version": APP_VERSION,
             }
         )
 
@@ -846,6 +1020,34 @@ def api_browse_dir():
     return jsonify({"path": path})
 
 
+@APP.route("/api/update/check")
+def api_update_check():
+    return jsonify(check_for_update())
+
+
+@APP.route("/api/update/apply", methods=["POST"])
+def api_update_apply():
+    with LOCK:
+        ok, message, details = apply_update()
+    payload = {"ok": ok, "message": message}
+    payload.update(details)
+    return (jsonify(payload), 200 if ok else 400)
+
+
+@APP.route("/api/update/restart", methods=["POST"])
+def api_update_restart():
+    """Relaunch the server so freshly updated code takes effect."""
+    def _restart():
+        import time
+        time.sleep(1.0)                      # let this response reach the browser
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception:
+            os._exit(1)
+    threading.Thread(target=_restart, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 @APP.route("/api/import_file", methods=["POST"])
 def api_import_file():
     """Pick a spreadsheet with the OS dialog and import it (sheets -> subcategories)."""
@@ -961,6 +1163,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
   header h1{font-size:16px;font-weight:600;margin:0;letter-spacing:.2px;}
   header .path{font-size:12px;color:var(--muted);margin-left:2px;}
   header .spacer{flex:1;}
+  .version-badge{
+    background:transparent;border:1px solid transparent;color:var(--muted);
+    font-size:11px;padding:2px 7px;border-radius:20px;margin-left:8px;
+  }
+  .version-badge:hover{border-color:var(--line);color:var(--text);}
+  .version-badge.has-update{
+    background:var(--accent-soft);border-color:var(--accent);
+    color:var(--accent);font-weight:600;
+  }
+  .upd-row{display:grid;grid-template-columns:70px 1fr;gap:8px;font-size:12px;padding:5px 0;
+    border-bottom:1px solid var(--line);}
+  .upd-row .sha{color:var(--muted);font-family:ui-monospace,Menlo,Consolas,monospace;}
   .btn{
     background:var(--panel-2);border:1px solid var(--line);color:var(--text);
     padding:7px 12px;border-radius:6px;font-size:13px;transition:.12s;
@@ -1099,6 +1313,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <header>
     <h1>Inventory Manager</h1>
     <span class="path" id="dataPath"></span>
+    <button class="version-badge" id="versionBadge" onclick="openUpdateModal()" title="Check for updates"></button>
     <span class="spacer"></span>
     <button class="btn ghost small" id="themeToggle" onclick="toggleTheme()" title="Toggle light / dark">🌙</button>
     <button class="btn ghost small" onclick="importFile()" title="Import a .csv / .xlsx file — each sheet becomes a subcategory">Import file</button>
@@ -1169,6 +1384,7 @@ function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;'
 async function loadState(){
   STATE = await api("/api/state");
   $("#dataPath").textContent = "· " + STATE.data_dir;
+  paintVersionBadge();
   renderTree();
   loadItems();
 }
@@ -1479,6 +1695,90 @@ async function moveItem(id,current){
   };
 }
 
+// ---------- updates ----------
+let UPDATE_INFO = null;
+
+function paintVersionBadge(){
+  const b=$("#versionBadge"); if(!b) return;
+  const v=STATE.version?("v"+STATE.version):"";
+  if(UPDATE_INFO && UPDATE_INFO.update_available){
+    b.textContent=`Update available → v${UPDATE_INFO.latest}`;
+    b.className="version-badge has-update";
+  }else{
+    b.textContent=v; b.className="version-badge";
+  }
+}
+
+async function checkUpdateQuietly(){
+  try{
+    UPDATE_INFO = await api("/api/update/check");
+    paintVersionBadge();
+  }catch(e){ /* offline is fine - stay silent */ }
+}
+
+async function openUpdateModal(){
+  const body=`<div id="updBody"><p class="muted">Checking GitHub…</p></div>`;
+  const foot=`<button class="btn ghost" onclick="closeModal()">Close</button>
+    <button class="btn primary" id="updBtn" style="display:none">Update now</button>`;
+  const m=modalShell("Software update", body, foot); showModal(m);
+
+  let info=UPDATE_INFO;
+  try{ info = await api("/api/update/check"); UPDATE_INFO=info; paintVersionBadge(); }
+  catch(e){ info=null; }
+
+  const el=m.querySelector("#updBody");
+  if(!info || info.error){
+    el.innerHTML=`<p>Could not reach GitHub.</p>
+      <p class="muted">${esc((info&&info.error)||"Check your internet connection.")}</p>`;
+    return;
+  }
+  const rows=(info.commits||[]).map(c=>`<div class="upd-row">
+      <span class="sha">${esc(c.sha)}</span>
+      <span>${esc(c.message)}<br><span class="muted">${esc(c.date)}</span></span></div>`).join("");
+
+  el.innerHTML=`
+    <div class="field"><label>Installed</label><b>v${esc(info.current)}</b></div>
+    <div class="field"><label>Latest on GitHub</label>
+      <b>${info.latest?("v"+esc(info.latest)):"unknown"}</b></div>
+    <div class="field"><label>Source</label>
+      <span class="muted">${esc(info.repo)} · ${esc(info.branch)}</span></div>
+    ${info.update_available
+      ? `<p>A newer version is available.</p>
+         ${rows?`<div style="margin-top:10px"><div class="muted" style="margin-bottom:4px">Recent changes</div>${rows}</div>`:""}
+         <p class="muted" style="margin-top:12px">Your inventory data is stored outside the program folder and is not touched.
+         Any file that gets replaced is backed up first.</p>`
+      : (info.latest
+          ? `<p>You are up to date.</p>`
+          : `<p>Could not read a version number from the published copy.</p>
+             <p class="muted">The version on GitHub may predate this updater. Push the
+             current code once and this will start reporting correctly.</p>`)}`;
+
+  const btn=m.querySelector("#updBtn");
+  if(info.update_available){
+    btn.style.display="";
+    btn.onclick=async()=>{
+      btn.disabled=true; btn.textContent="Downloading…";
+      try{
+        const r=await api("/api/update/apply",{method:"POST"});
+        const n=(r.changed||[]).length+(r.added||[]).length;
+        el.innerHTML=`<p><b>${esc(r.message)}</b></p>
+          ${n?`<p class="muted">${n} file(s) updated.</p>`:""}
+          ${r.backup?`<p class="muted">Backup: ${esc(r.backup)}</p>`:""}
+          <p>Restart the app to use the new version.</p>`;
+        btn.textContent="Restart now"; btn.disabled=false;
+        btn.onclick=async()=>{
+          btn.disabled=true; btn.textContent="Restarting…";
+          try{ await api("/api/update/restart",{method:"POST"}); }catch(e){}
+          setTimeout(()=>location.reload(), 3000);
+        };
+      }catch(e){
+        el.innerHTML=`<p>Update failed.</p><p class="muted">${esc(e.message||e.error||"Unknown error")}</p>`;
+        btn.style.display="none";
+      }
+    };
+  }
+}
+
 // ---------- import ----------
 async function importFile(){
   toast("Choose a file in the dialog…");
@@ -1538,6 +1838,7 @@ function openDirModal(){
 }
 
 loadState();
+setTimeout(checkUpdateQuietly, 1500);   // background check, silent if offline
 </script>
 </body>
 </html>

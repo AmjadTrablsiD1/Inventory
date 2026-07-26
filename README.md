@@ -31,6 +31,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Choose your data folder** | Native folder picker; data is copied along when you switch |
 | **Readable CSV mirror** | One CSV per category, subcategories as labelled sections |
 | **Spreadsheet importer** | Feed it an `.xlsx` or `.csv` and it maps sheets → subcategories |
+| **Built-in updater** | Checks GitHub for a new version and installs it, with a backup |
 
 ---
 
@@ -173,12 +174,40 @@ Always try `--dry-run` first on a file you care about — it prints the full map
 
 ---
 
+## Updating
+
+The version number in the header doubles as an update button. On startup the app quietly asks GitHub whether a newer version exists; if there is one, the badge lights up as **"Update available"**.
+
+Clicking it shows what you have, what's published, and the recent commit messages. **Update now** downloads the repository archive and replaces the program files, then offers to restart.
+
+Publishing a new version is just:
+
+1. Bump `APP_VERSION` at the top of `app.py`.
+2. Commit and push.
+
+Everyone running the app sees the update on their next start.
+
+**What it will and won't do:**
+
+- It only ever fetches from **one repository** — auto-detected from this checkout's `git remote origin`, falling back to a constant in `app.py`. Override with `INVENTORY_REPO="owner/name"`.
+- Every file it replaces is copied to `backup_before_update_<timestamp>/` first.
+- It only writes files with known source extensions (`.py`, `.md`, `.txt`, `.sh`, `.bat`, `.vbs`, `.applescript`). Anything else in the archive — binaries, `.git`, CI config — is ignored.
+- It refuses archives that are corrupt or don't contain `app.py`, and rejects entries with `..` in their paths.
+- **Your inventory data is never touched.** It lives outside the program folder.
+- Nothing is downloaded or installed without you clicking Update now. If GitHub is unreachable, the check fails silently and the app works normally.
+
+> Because updates run code from the repository, only point `INVENTORY_REPO` at a repository you control.
+
+---
+
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `INVENTORY_DIR` | `~/InventoryData` | Where the CSV files are stored |
 | `INVENTORY_PORT` | `8765` | Port the local server listens on |
+| `INVENTORY_REPO` | auto-detected | Update source, as `owner/name` |
+| `INVENTORY_BRANCH` | `main` | Branch the updater reads from |
 
 Your chosen data folder is remembered in `~/.inventory_manager_config.json`.
 

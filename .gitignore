@@ -38,3 +38,6 @@ history.csv
 
 # Logs
 *.log
+
+# Created by the built-in updater before it overwrites anything
+backup_before_update_*/

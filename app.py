@@ -68,7 +68,7 @@ LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -87,6 +87,7 @@ CONFIG_FILE = Path.home() / ".inventory_manager_config.json"
 INVENTORY_CSV = "inventory.csv"
 CATEGORIES_CSV = "categories.csv"
 HISTORY_CSV = "history.csv"
+DELETED_CSV = "deleted_items.csv"   # every deleted item is archived here
 
 # Human-readable mirror: one CSV per top-level category, subcategories as
 # labelled sections inside it. inventory.csv stays the master copy.
@@ -95,7 +96,17 @@ HIER_MARKER = "# Inventory Manager - readable category view (auto-generated)"
 UNCATEGORIZED = "_Uncategorized"
 
 # Fixed base columns that always exist on every item row.
-BASE_COLUMNS = ["id", "category_path", "name", "quantity", "date_added", "last_modified"]
+#   color      - "#rrggbb" chosen in the app or carried over from an import
+#   status     - "" (in stock) or "used"
+#   used_note  - free text: where/what it is used for
+#   used_date  - when it was marked used
+BASE_COLUMNS = ["id", "category_path", "name", "quantity",
+                "color", "status", "used_note", "used_date",
+                "date_added", "last_modified"]
+
+# Columns that exist for the program's benefit rather than the user's.
+# A "clean" export leaves these out.
+INTERNAL_COLUMNS = ["id"]
 
 
 # ----------------------------------------------------------------------------
@@ -138,6 +149,10 @@ def paths():
         d / CATEGORIES_CSV,
         d / HISTORY_CSV,
     )
+
+
+def deleted_path():
+    return get_data_dir() / DELETED_CSV
 
 
 # ----------------------------------------------------------------------------
@@ -189,6 +204,38 @@ def pick_directory_native():
         for cmd in (["zenity", "--file-selection", "--directory",
                      "--title=Choose a folder for your inventory data"],
                     ["kdialog", "--getexistingdirectory", str(Path.home())]):
+            if shutil.which(cmd[0]):
+                r = run_hidden(cmd)
+                return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+        return None
+    except Exception:
+        return None
+
+
+def pick_save_file_native(default_name="inventory_export.csv"):
+    """Open the OS 'save as' dialog. Returns a path or None."""
+    try:
+        if sys.platform == "darwin":
+            script = ('POSIX path of (choose file name with prompt '
+                      '"Export inventory as CSV" default name "%s")' % default_name)
+            r = run_hidden(["osascript", "-e", script])
+            return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+        if os.name == "nt":
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$f = New-Object System.Windows.Forms.SaveFileDialog; "
+                f"$f.FileName = '{default_name}'; "
+                "$f.Filter = 'CSV file|*.csv|All files|*.*'; "
+                "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }"
+            )
+            r = run_hidden(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                            "-Command", ps])
+            return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+        for cmd in (["zenity", "--file-selection", "--save", "--confirm-overwrite",
+                     f"--filename={default_name}"],
+                    ["kdialog", "--getsavefilename", default_name]):
             if shutil.which(cmd[0]):
                 r = run_hidden(cmd)
                 return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
@@ -399,7 +446,11 @@ def write_hierarchy():
                         for k, v in it.items():
                             if k not in BASE_COLUMNS and str(v).strip() and k not in used:
                                 used.append(k)
-                    cols = ["id", "name", "quantity"] + used + ["date_added", "last_modified"]
+                    # show the status/colour columns only where they carry data
+                    extra_base = [c for c in ("color", "status", "used_note", "used_date")
+                                  if any(str(it.get(c, "")).strip() for it in items)]
+                    cols = (["id", "name", "quantity"] + used + extra_base
+                            + ["date_added", "last_modified"])
                     w.writerow(cols)
                     if not items:
                         w.writerow(["(no items in this category)"])
@@ -447,6 +498,51 @@ def write_hierarchy():
                 continue
     except Exception:
         pass
+
+
+# ----------------------------------------------------------------------------
+# Deleted-items archive
+# ----------------------------------------------------------------------------
+
+DELETED_COLUMNS = ["deleted_at", "deleted_reason", "category_path", "name",
+                   "quantity", "color", "status", "used_note", "used_date",
+                   "date_added", "last_modified", "other_fields", "id"]
+
+
+def archive_deleted(item, reason=""):
+    """Append a deleted item to deleted_items.csv, keeping all of its details."""
+    f = deleted_path()
+    extras = {k: v for k, v in item.items()
+              if k not in BASE_COLUMNS and str(v).strip()}
+    row = {
+        "deleted_at": now_str(),
+        "deleted_reason": reason or "",
+        "other_fields": " | ".join(f"{k}={v}" for k, v in sorted(extras.items())),
+    }
+    for c in DELETED_COLUMNS:
+        row.setdefault(c, item.get(c, ""))
+    try:
+        new_file = not f.exists()
+        with f.open("a", newline="", encoding="utf-8-sig") as fh:
+            w = csv.DictWriter(fh, fieldnames=DELETED_COLUMNS, extrasaction="ignore")
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+    except Exception:
+        pass
+
+
+def read_deleted(limit=500):
+    f = deleted_path()
+    if not f.exists():
+        return []
+    try:
+        with f.open("r", newline="", encoding="utf-8-sig") as fh:
+            rows = [dict(r) for r in csv.DictReader(fh)]
+    except Exception:
+        return []
+    rows.reverse()
+    return rows[:limit]
 
 
 def read_history(limit=500):
@@ -533,6 +629,58 @@ def build_tree():
         return out
 
     return to_list(root)
+
+
+def build_clean_export(category="", include_sub=True, include_dates=True,
+                       include_used=True, include_color=False):
+    """
+    Produce plain rows for export: real inventory data only, with friendly
+    column names and none of the program's internal bookkeeping (ids, etc).
+    Returns (header, rows).
+    """
+    rows, custom = read_inventory()
+
+    selected = []
+    for r in rows:
+        p = (r.get("category_path") or "").strip()
+        if category:
+            if include_sub:
+                if not (p == category or p.startswith(category + "/")):
+                    continue
+            elif p != category:
+                continue
+        selected.append(r)
+
+    used_custom = [c for c in custom
+                   if any(str(r.get(c, "")).strip() for r in selected)]
+
+    cols = ["category_path", "name", "quantity"] + used_custom
+    if include_color:
+        cols.append("color")
+    if include_used:
+        cols += ["status", "used_note", "used_date"]
+    if include_dates:
+        cols += ["date_added", "last_modified"]
+    cols = [c for c in cols if c not in INTERNAL_COLUMNS]
+
+    labels = {
+        "category_path": "Category", "name": "Name", "quantity": "Quantity",
+        "color": "Colour", "status": "Status", "used_note": "Used for",
+        "used_date": "Used on", "date_added": "Added", "last_modified": "Last modified",
+    }
+    header = [labels.get(c, c) for c in cols]
+
+    out = []
+    for r in sorted(selected, key=lambda x: ((x.get("category_path") or "").lower(),
+                                             (x.get("name") or "").lower())):
+        row = []
+        for c in cols:
+            v = r.get(c, "")
+            if c == "status":
+                v = "Used" if str(v).strip() == "used" else "In stock"
+            row.append(v)
+        out.append(row)
+    return header, out
 
 
 def inherited_required_fields(category_path):
@@ -840,12 +988,84 @@ def api_item_delete():
                 break
         if not target:
             return jsonify({"error": "Item not found."}), 404
+        reason = (data.get("reason") or "").strip()
+        archive_deleted(target, reason)          # keep a permanent record
         rows = [r for r in rows if r.get("id") != item_id]
         write_inventory(rows, custom)
         log_history("delete_item",
                     f"{target.get('category_path','')}/{target.get('name','')}",
-                    f"id={item_id}")
+                    f"id={item_id}" + (f", reason: {reason}" if reason else ""))
         return jsonify({"ok": True})
+
+
+@APP.route("/api/item/status", methods=["POST"])
+def api_item_status():
+    """Mark an item as used (with a note about where), or put it back in stock."""
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        item_id = data.get("id")
+        status = (data.get("status") or "").strip().lower()
+        note = (data.get("used_note") or "").strip()
+        if status not in ("", "used"):
+            return jsonify({"error": "Unknown status."}), 400
+
+        rows, custom = read_inventory()
+        target = next((r for r in rows if r.get("id") == item_id), None)
+        if not target:
+            return jsonify({"error": "Item not found."}), 404
+
+        target["status"] = status
+        target["used_note"] = note if status == "used" else ""
+        target["used_date"] = now_str() if status == "used" else ""
+        target["last_modified"] = now_str()
+        write_inventory(rows, custom)
+        log_history(
+            "mark_used" if status == "used" else "return_to_stock",
+            f"{target.get('category_path','')}/{target.get('name','')}",
+            note or "")
+        return jsonify({"ok": True})
+
+
+@APP.route("/api/deleted")
+def api_deleted():
+    with LOCK:
+        ensure_files()
+        return jsonify({"deleted": read_deleted(), "file": str(deleted_path())})
+
+
+@APP.route("/api/export", methods=["POST"])
+def api_export():
+    """Write a clean CSV of the current data to a location the user picks."""
+    with LOCK:
+        ensure_files()
+        data = request.get_json(silent=True) or {}
+        category = (data.get("category") or "").strip()
+        header, rows = build_clean_export(
+            category=category,
+            include_sub=bool(data.get("include_sub", True)),
+            include_dates=bool(data.get("include_dates", True)),
+            include_used=bool(data.get("include_used", True)),
+            include_color=bool(data.get("include_color", False)),
+        )
+        if not rows:
+            return jsonify({"error": "There is nothing to export in that selection."}), 400
+
+        default = (safe_filename(category.replace("/", "-")) or "inventory") + "_export.csv"
+        target = (data.get("path") or "").strip() or pick_save_file_native(default)
+        if not target:
+            return jsonify({"cancelled": True})
+        if not target.lower().endswith(".csv"):
+            target += ".csv"
+        try:
+            with open(target, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(header)
+                w.writerows(rows)
+        except Exception as e:
+            return jsonify({"error": f"Could not write the file: {e}"}), 400
+        log_history("export", category or "(all)", f"{len(rows)} items -> {target}")
+        return jsonify({"ok": True, "path": target, "count": len(rows)})
 
 
 @APP.route("/api/item/move", methods=["POST"])
@@ -1248,6 +1468,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   tbody tr{cursor:pointer;}
   tbody tr:hover{background:var(--panel-2);}
+  .swatch{width:6px;height:30px;border-radius:3px;}
+  tbody tr.is-used td{opacity:.62;font-style:italic;}
   .empty-state{padding:60px 20px;text-align:center;color:var(--muted);}
   .empty-state h3{color:var(--text);font-weight:600;margin:0 0 6px;}
 
@@ -1317,6 +1539,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <span class="spacer"></span>
     <button class="btn ghost small" id="themeToggle" onclick="toggleTheme()" title="Toggle light / dark">🌙</button>
     <button class="btn ghost small" onclick="importFile()" title="Import a .csv / .xlsx file — each sheet becomes a subcategory">Import file</button>
+    <button class="btn ghost small" onclick="openExportModal()" title="Export a clean CSV">Export</button>
     <button class="btn ghost small" onclick="openHistory()">History</button>
     <button class="btn ghost small" onclick="openDirModal()">Data folder</button>
     <button class="btn primary small" onclick="openItemModal()">+ Item</button>
@@ -1454,16 +1677,28 @@ function renderTable(items, customFields){
   }
   // columns that actually have data in this view
   const usedCustom = customFields.filter(f=>items.some(it=>(it[f]||"").trim()!==""));
-  const cols=["name","quantity","category_path",...usedCustom,"date_added","last_modified"];
-  const labels={name:"Name",quantity:"Qty",category_path:"Category",date_added:"Added",last_modified:"Modified"};
-  let html="<table><thead><tr>";
+  const anyUsed = items.some(it=>(it.status||"")==="used");
+  const cols=["name","quantity","category_path",...usedCustom,
+              ...(anyUsed?["status","used_note"]:[]),"date_added","last_modified"];
+  const labels={name:"Name",quantity:"Qty",category_path:"Category",date_added:"Added",
+                last_modified:"Modified",status:"Status",used_note:"Used for"};
+  let html="<table><thead><tr><th style='width:6px;padding:0'></th>";
   cols.forEach(c=>html+=`<th>${esc(labels[c]||c)}</th>`);
   html+="<th></th></tr></thead><tbody>";
   items.forEach(it=>{
-    html+=`<tr onclick='editItem(${JSON.stringify(it.id)})'>`;
-    cols.forEach(c=>html+=`<td title="${esc(it[c])}">${esc(it[c])}</td>`);
-    html+=`<td><button class="icon-btn" title="Move" onclick='event.stopPropagation();moveItem(${JSON.stringify(it.id)},${JSON.stringify(it.category_path)})'>⇄</button>
-           <button class="icon-btn" title="Delete" onclick='event.stopPropagation();deleteItem(${JSON.stringify(it.id)})'>🗑</button></td>`;
+    const used=(it.status||"")==="used";
+    const swatch=it.color?`background:${esc(it.color)}`:"background:transparent";
+    html+=`<tr class="${used?'is-used':''}" onclick='editItem(${JSON.stringify(it.id)})'>`;
+    html+=`<td style="padding:0"><div class="swatch" style="${swatch}"></div></td>`;
+    cols.forEach(c=>{
+      let v=it[c]||"";
+      if(c==="status") v = used?"Used":"In stock";
+      html+=`<td title="${esc(v)}">${esc(v)}</td>`;
+    });
+    html+=`<td style="white-space:nowrap">
+           <button class="icon-btn" title="${used?'Return to stock':'Mark as used'}" onclick='event.stopPropagation();toggleUsed(${JSON.stringify(it.id)},${used?"true":"false"})'>${used?"↩":"✔"}</button>
+           <button class="icon-btn" title="Move" onclick='event.stopPropagation();moveItem(${JSON.stringify(it.id)},${JSON.stringify(it.category_path)})'>⇄</button>
+           <button class="icon-btn" title="Delete" onclick='event.stopPropagation();deleteItem(${JSON.stringify(it.id)},${JSON.stringify(it.name)})'>🗑</button></td>`;
     html+="</tr>";
   });
   html+="</tbody></table>";
@@ -1585,6 +1820,23 @@ async function buildItemModal(item){
       <input id="f_qty" value="${item?esc(item.quantity):"1"}" type="text"></div>
     <div class="field"><label>Category</label>
       <select id="f_cat"><option value="">— none —</option>${opts}</select></div>
+    <div class="field"><label>Colour</label>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="color" id="f_color" value="${item&&item.color?esc(item.color):"#4c9be8"}"
+               style="width:52px;padding:2px;height:34px;">
+        <button class="btn small" type="button" id="clearColor">No colour</button>
+        <span class="muted" id="colorState">${item&&item.color?esc(item.color):"none"}</span>
+      </div></div>
+    <div class="field"><label>Status</label>
+      <select id="f_status">
+        <option value="">In stock</option>
+        <option value="used" ${item&&item.status==="used"?"selected":""}>Used</option>
+      </select></div>
+    <div class="field" id="usedWrap" style="display:${item&&item.status==="used"?"block":"none"}">
+      <label>Used for / where</label>
+      <input id="f_usednote" value="${item?esc(item.used_note||""):""}" placeholder="e.g. installed in Lab 2 / given to Ahmed">
+      ${item&&item.used_date?`<div class="muted" style="margin-top:4px">Marked used: ${esc(item.used_date)}</div>`:""}
+    </div>
     <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
     <div class="muted" style="margin-bottom:8px;">Additional info — add any fields this item needs</div>
     <div id="customFields"></div>
@@ -1656,11 +1908,31 @@ async function buildItemModal(item){
   m.querySelector("#f_cat").onchange=e=>applyRequired(e.target.value);
   if(!isEdit && startCat) applyRequired(startCat);
 
+  // colour picker: remembers "no colour" as a separate state from a chosen one
+  let chosenColor = (item && item.color) ? item.color : "";
+  const colorInput=m.querySelector("#f_color"), colorState=m.querySelector("#colorState");
+  colorInput.oninput=()=>{ chosenColor=colorInput.value; colorState.textContent=chosenColor; };
+  m.querySelector("#clearColor").onclick=()=>{ chosenColor=""; colorState.textContent="none"; };
+
+  // show the "used for" box only when the status is Used
+  const statusSel=m.querySelector("#f_status");
+  statusSel.onchange=()=>{
+    m.querySelector("#usedWrap").style.display = statusSel.value==="used" ? "block" : "none";
+  };
+
   m.querySelector("#saveItem").onclick=async()=>{
+    const status=statusSel.value;
+    const usedNote=m.querySelector("#f_usednote").value.trim();
     const fields={
       name:m.querySelector("#f_name").value.trim(),
       quantity:m.querySelector("#f_qty").value.trim(),
-      category_path:m.querySelector("#f_cat").value
+      category_path:m.querySelector("#f_cat").value,
+      color:chosenColor,
+      status:status,
+      used_note:status==="used"?usedNote:"",
+      used_date:status==="used"
+        ? ((item&&item.used_date)?item.used_date:new Date().toISOString().slice(0,19).replace("T"," "))
+        : ""
     };
     if(!fields.name){toast("Name is required","err");return;}
     customPairs.forEach(p=>{ if(p.key.trim()) fields[p.key.trim()]=p.value; });
@@ -1672,11 +1944,74 @@ async function buildItemModal(item){
   };
 }
 
-async function deleteItem(id){
-  if(!confirm("Delete this item?"))return;
-  try{await api("/api/item/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
-    toast("Item deleted"); loadState();
+async function deleteItem(id,name){
+  const reason=prompt(`Delete "${name||"this item"}"?\n\nIt will be archived in deleted_items.csv.\nOptionally note why (leave blank to just delete):`);
+  if(reason===null) return;      // cancelled
+  try{await api("/api/item/delete",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id,reason})});
+    toast("Deleted and archived"); loadState();
   }catch(e){toast(e.error||"Failed","err");}
+}
+
+async function toggleUsed(id,isUsed){
+  let note="";
+  if(!isUsed){
+    note=prompt("Mark as used.\n\nWhere is it used / who has it?");
+    if(note===null) return;
+  }else if(!confirm("Put this item back in stock?")) return;
+  try{
+    await api("/api/item/status",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id,status:isUsed?"":"used",used_note:note})});
+    toast(isUsed?"Back in stock":"Marked as used"); loadState();
+  }catch(e){toast(e.error||"Failed","err");}
+}
+
+// ---------- export ----------
+function openExportModal(){
+  const cat=SELECTED;
+  const body=`<p class="muted">Writes a clean CSV with just your data — no internal ids or program columns.</p>
+    <div class="field"><label>What to export</label>
+      <select id="expScope">
+        <option value="all">Everything (${STATE.item_count} items)</option>
+        ${cat?`<option value="cat" selected>Only "${esc(cat)}" and its subcategories</option>`:""}
+      </select></div>
+    <label class="check" style="margin:8px 0"><input type="checkbox" id="expDates" checked> include date columns</label>
+    <label class="check" style="margin:8px 0"><input type="checkbox" id="expUsed" checked> include status / used-for columns</label>
+    <label class="check" style="margin:8px 0"><input type="checkbox" id="expColor"> include colour column</label>`;
+  const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" id="expGo">Choose file &amp; export</button>`;
+  const m=modalShell("Export CSV", body, foot); showModal(m);
+  m.querySelector("#expGo").onclick=async()=>{
+    const btn=m.querySelector("#expGo"); btn.disabled=true; btn.textContent="Choose a location…";
+    try{
+      const r=await api("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          category:m.querySelector("#expScope").value==="cat"?cat:"",
+          include_sub:true,
+          include_dates:m.querySelector("#expDates").checked,
+          include_used:m.querySelector("#expUsed").checked,
+          include_color:m.querySelector("#expColor").checked})});
+      if(r.cancelled){ btn.disabled=false; btn.textContent="Choose file & export"; return; }
+      toast(`Exported ${r.count} item(s)`); closeModal();
+    }catch(e){ toast(e.error||"Export failed","err"); btn.disabled=false; btn.textContent="Choose file & export"; }
+  };
+}
+
+// ---------- deleted items ----------
+async function openDeleted(){
+  const data=await api("/api/deleted");
+  const rows=data.deleted||[];
+  const body = rows.length
+    ? `<p class="muted">Archived in ${esc(data.file)}</p>
+       <div style="margin-top:10px">${rows.map(d=>`<div class="hist-item">
+        <span class="ts">${esc(d.deleted_at)}</span>
+        <span class="act">${esc(d.category_path||"—")}</span>
+        <span><b>${esc(d.name)}</b> ×${esc(d.quantity)}
+        ${d.deleted_reason?` — <span class="muted">${esc(d.deleted_reason)}</span>`:""}
+        ${d.other_fields?`<br><span class="muted">${esc(d.other_fields)}</span>`:""}</span></div>`).join("")}</div>`
+    : `<p class="muted">Nothing has been deleted yet.</p>`;
+  const m=modalShell("Deleted items", body, `<button class="btn primary" onclick="closeModal()">Close</button>`);
+  m.style.maxWidth="760px"; showModal(m);
 }
 
 async function moveItem(id,current){
@@ -1800,7 +2135,9 @@ async function openHistory(){
         <span class="act">${esc(h.action)}</span>
         <span>${esc(h.target)}${h.detail?` — <span class="muted">${esc(h.detail)}</span>`:""}</span></div>`).join("")}</div>`
     : `<p class="muted">No changes recorded yet.</p>`;
-  const m=modalShell("Change history", body, `<button class="btn primary" onclick="closeModal()">Close</button>`);
+  const m=modalShell("Change history", body,
+    `<button class="btn ghost" onclick="openDeleted()">View deleted items</button>
+     <button class="btn primary" onclick="closeModal()">Close</button>`);
   m.style.maxWidth="720px";
   showModal(m);
 }

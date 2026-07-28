@@ -32,6 +32,10 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Readable CSV mirror** | One CSV per category, subcategories as labelled sections |
 | **Spreadsheet importer** | Feed it an `.xlsx` or `.csv` and it maps sheets → subcategories |
 | **Built-in updater** | Checks GitHub for a new version and installs it, with a backup |
+| **Item colours** | Pick a colour per item — and imports keep the colours from your spreadsheet |
+| **Used, not deleted** | Mark something as used and record where it went, keeping it in the list |
+| **Delete archive** | Deleted items are saved to `deleted_items.csv` with date, reason and details |
+| **Clean CSV export** | Export just your data, with no internal ids or program columns |
 
 ---
 
@@ -101,6 +105,7 @@ InventoryData/
 ├── inventory.csv        # master data — one row per item
 ├── categories.csv       # the category tree + required fields
 ├── history.csv          # timestamped change log
+├── deleted_items.csv    # archive of everything you've deleted
 └── by_category/         # auto-generated readable view
     ├── _Overview.csv    # index of every category with item counts
     ├── Electronics.csv
@@ -169,8 +174,32 @@ It figures out the messy parts for you:
 - **Handles encodings** — UTF-8, UTF-8-BOM and Latin-1, so umlauts and accents survive.
 - Every other column becomes a custom field; blank rows and empty sheets are skipped.
 - A plain `.csv` has no sheets, so it becomes a single category named after the file.
+- **Keeps your colours** — a filled row (or a filled column, which fills a cell in every row) carries its colour onto the item. Excel *theme* colours are the one exception: the file stores them as a reference rather than an RGB value, so those come in without a colour. Direct and standard-palette fills work exactly.
 
 Always try `--dry-run` first on a file you care about — it prints the full mapping and writes nothing.
+
+---
+
+## Colours, status and deletion
+
+**Colours.** Every item can carry a colour, set with the picker in the item form (or cleared with **No colour**). It shows as a stripe down the left of the row. Colours also survive an import: if rows or columns in your spreadsheet are filled with a colour, each item keeps it.
+
+**Used rather than deleted.** When you take something into use, click the **✔** on its row instead of deleting it. You're asked where it went, and the item stays in the inventory marked *Used* — greyed out, with the note and date in the `Status` and `Used for` columns. The **↩** button puts it back in stock. This keeps a truthful record of what you own versus what's in circulation.
+
+**Deletion is archived.** Deleting asks for an optional reason and appends the item to `deleted_items.csv` before removing it — with the timestamp, reason, category, quantity, colour, status and all its custom fields preserved in an `other_fields` column. Nothing is silently lost. View it in the app under **History → View deleted items**.
+
+---
+
+## Exporting
+
+**Export** in the header writes a clean CSV: friendly column headings, no internal `id`, and `Status` rendered as "In stock"/"Used" rather than raw values. You choose:
+
+- everything, or just the selected category and its subcategories
+- whether to include the date columns
+- whether to include status / used-for columns
+- whether to include the colour column
+
+You pick where to save it with a normal Save dialog. This is the file to hand to someone else — unlike `inventory.csv`, it carries nothing the program needs internally.
 
 ---
 

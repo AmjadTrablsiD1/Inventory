@@ -25,6 +25,7 @@ Options:
     --sheet NAME      Import only this one sheet.
 """
 
+import re
 import csv
 import sys
 import uuid
@@ -32,6 +33,10 @@ import argparse
 from pathlib import Path
 
 import app as inv  # reuses the app's data folder, CSV format and history log
+
+# Internal key used to carry a row's spreadsheet fill colour through the
+# mapping step. It never becomes a custom field; it lands in the 'color' column.
+COLOR_KEY = "__row_color__"
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +53,9 @@ def _clean(v):
     if v is None:
         return ""
     s = str(v).strip()
-    return "" if s.lower() in ("nan", "none", "null") else s
+    # "nan"/"null" are artefacts of other export tools. "none" is NOT treated as
+    # empty - a user may well have typed it as a real answer.
+    return "" if s.lower() in ("nan", "null") else s
 
 
 def read_csv_sheets(path):
@@ -75,6 +82,61 @@ def read_csv_sheets(path):
     raise SystemExit(f"Could not decode {path.name} with any known encoding.")
 
 
+def cell_color(cell):
+    """
+    The cell's background fill as '#rrggbb', or '' if it has none.
+
+    Excel stores fills as direct RGB, an indexed palette entry, or a theme
+    reference. The first two are exact; theme colours have no RGB value stored
+    in the file, so those are reported as no colour rather than guessed at.
+    """
+    try:
+        fill = cell.fill
+        if fill is None or fill.patternType in (None, "none"):
+            return ""
+        color = fill.fgColor or fill.start_color
+        if color is None:
+            return ""
+        if color.type == "rgb" and isinstance(color.rgb, str):
+            rgb = color.rgb
+            if len(rgb) == 8:          # AARRGGBB - drop the alpha
+                if rgb[:2] == "00":    # fully transparent = no fill
+                    return ""
+                rgb = rgb[2:]
+            if len(rgb) == 6 and re.fullmatch(r"[0-9A-Fa-f]{6}", rgb):
+                if rgb.upper() == "FFFFFF":
+                    return ""          # plain white is not a highlight
+                return "#" + rgb.lower()
+        if color.type == "indexed":
+            from openpyxl.styles.colors import COLOR_INDEX
+            idx = color.indexed
+            if isinstance(idx, int) and 0 <= idx < len(COLOR_INDEX):
+                rgb = COLOR_INDEX[idx]
+                if isinstance(rgb, str) and len(rgb) == 8:
+                    rgb = rgb[2:]
+                    if rgb.upper() not in ("FFFFFF", "000000"):
+                        return "#" + rgb.lower()
+    except Exception:
+        pass
+    return ""
+
+
+def row_color(cells, header_len):
+    """
+    One colour for the whole item: the most common fill across the row's cells.
+    Covers both a coloured row and a coloured column (that column's cell is the
+    only filled one in the row).
+    """
+    seen = {}
+    for c in cells[:header_len]:
+        col = cell_color(c)
+        if col:
+            seen[col] = seen.get(col, 0) + 1
+    if not seen:
+        return ""
+    return max(seen.items(), key=lambda kv: kv[1])[0]
+
+
 def read_excel_sheets(path):
     """Every worksheet becomes its own (sheet_name, rows) pair."""
     try:
@@ -86,26 +148,32 @@ def read_excel_sheets(path):
         )
     from openpyxl import load_workbook
 
-    wb = load_workbook(path, read_only=True, data_only=True)
+    # read_only=False so cell fills (colours) are available
+    wb = load_workbook(path, data_only=True)
     out = []
     for ws in wb.worksheets:
-        grid = list(ws.iter_rows(values_only=True))
+        grid = list(ws.iter_rows())
         if not grid:
             out.append((ws.title, []))
             continue
         # first non-empty row is the header
         start = 0
         for i, row in enumerate(grid):
-            if any(_clean(c) for c in row):
+            if any(_clean(c.value) for c in row):
                 start = i
                 break
-        header = [_clean(c) or f"column_{i+1}" for i, c in enumerate(grid[start])]
+        header = [_clean(c.value) or f"column_{i+1}"
+                  for i, c in enumerate(grid[start])]
         rows = []
         for raw in grid[start + 1:]:
-            if not any(_clean(c) for c in raw):
+            if not any(_clean(c.value) for c in raw):
                 continue  # skip blank separator rows
-            rows.append({header[i]: _clean(v)
-                         for i, v in enumerate(raw) if i < len(header)})
+            row = {header[i]: _clean(c.value)
+                   for i, c in enumerate(raw) if i < len(header)}
+            color = row_color(list(raw), len(header))
+            if color:
+                row[COLOR_KEY] = color
+            rows.append(row)
         out.append((ws.title, rows))
     wb.close()
     return out
@@ -140,16 +208,21 @@ def row_to_item(row, name_col, qty_col):
     """Turn one spreadsheet row into an inventory item dict."""
     fields = {}
     for key, val in row.items():
-        if not key or not _clean(val):
+        if not key or key == COLOR_KEY or not _clean(val):
             continue
         if key == name_col or key == qty_col:
             continue
         fields[inv.sanitize_field_name(key)] = _clean(val)
 
+    color = row.get(COLOR_KEY, "")
+    if color:
+        fields["color"] = color        # a real base column, not a custom field
+
     name = _clean(row.get(name_col)) if name_col else ""
     if not name:
         # no usable name column -> build one from the first filled value
-        name = next((v for v in (_clean(x) for x in row.values()) if v), "")
+        name = next((v for k, v in ((k, _clean(x)) for k, x in row.items())
+                     if v and k != COLOR_KEY), "")
     qty = _clean(row.get(qty_col)) if qty_col else ""
     return name, (qty or "1"), fields
 
@@ -188,9 +261,11 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False):
             clean_sheet = str(sheet_name).strip().replace("/", "-") or "Sheet"
             cat_path = f"{top}/{clean_sheet}"
 
-        header = list(sheet_rows[0].keys()) if sheet_rows else []
+        header = [k for k in (sheet_rows[0].keys() if sheet_rows else [])
+                  if k != COLOR_KEY]
         name_col = pick_column(header, NAME_HINTS)
         qty_col = pick_column(header, QTY_HINTS)
+        colored = sum(1 for r in sheet_rows if r.get(COLOR_KEY))
 
         cat_map.setdefault(top, [])
         cat_map.setdefault(cat_path, [])
@@ -216,7 +291,8 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False):
 
         added_total += count
         summary.append((cat_path, count, name_col, qty_col,
-                        [h for h in header if h not in (name_col, qty_col)]))
+                        [h for h in header if h not in (name_col, qty_col)],
+                        colored))
 
     # ---- report ----
     print()
@@ -226,7 +302,7 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False):
     print(f"  Category      : {top}")
     print(f"  Data folder   : {inv.get_data_dir()}")
     print()
-    for cat_path, count, name_col, qty_col, extras in summary:
+    for cat_path, count, name_col, qty_col, extras, colored in summary:
         print(f"  {cat_path}")
         print(f"      items       : {count}")
         print(f"      name from   : {name_col or '(first non-empty column)'}")
@@ -234,6 +310,8 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False):
         if extras:
             shown = ", ".join(extras[:8]) + (" ..." if len(extras) > 8 else "")
             print(f"      extra fields: {shown}")
+        if colored:
+            print(f"      colours kept: {colored} row(s)")
         print()
     print(f"  Total items: {added_total}")
     print("=" * 66)

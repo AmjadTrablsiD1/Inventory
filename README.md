@@ -28,6 +28,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Auto-save** | Every change written to CSV immediately |
 | **Change history** | Timestamped log of every add, edit, move and delete |
 | **Light & dark mode** | Toggle in the header, remembered across restarts |
+| **Custom background** | Choose the light-mode background from presets or any colour |
 | **Choose your data folder** | Native folder picker; data is copied along when you switch |
 | **Readable CSV mirror** | One CSV per category, subcategories as labelled sections |
 | **Spreadsheet importer** | Feed it an `.xlsx` or `.csv` and it maps sheets → subcategories |
@@ -200,6 +201,16 @@ It figures out the messy parts for you:
 - **Keeps your colours** — a filled row (or a filled column, which fills a cell in every row) carries its colour onto the item. Excel *theme* colours are the one exception: the file stores them as a reference rather than an RGB value, so those come in without a colour. Direct and standard-palette fills work exactly.
 
 Always try `--dry-run` first on a file you care about — it prints the full mapping and writes nothing.
+
+---
+
+## Appearance
+
+The **🌙 / ☀️** button switches between light and dark mode. The **🎨** button next to it opens **Appearance**, where you can change the **light-mode background colour** — eight presets (paper white, warm cream, mint, sky, lavender, slate …) or any colour you like from the picker, plus **Reset to default**.
+
+Panels, borders, muted text and the selection highlight are all derived from the colour you pick, so the interface stays coherent instead of just one value changing. If you choose something dark, the text switches to light automatically so everything stays readable. Dark mode keeps its own palette and is unaffected.
+
+Your choice is remembered in the browser, along with the theme and the "fill whole row with colour" setting.
 
 ---
 

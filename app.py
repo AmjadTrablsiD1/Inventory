@@ -68,7 +68,7 @@ LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -1991,6 +1991,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <button class="version-badge" id="versionBadge" onclick="openUpdateModal()" title="Check for updates"></button>
     <span class="spacer"></span>
     <button class="btn ghost small" id="themeToggle" onclick="toggleTheme()" title="Toggle light / dark">🌙</button>
+    <button class="btn ghost small" onclick="openAppearanceModal()" title="Appearance — light-mode background colour">🎨</button>
     <button class="btn ghost small" onclick="openImportModal()" title="Import a spreadsheet, or every spreadsheet in a folder">Import</button>
     <button class="btn ghost small" onclick="openOrderModal()" title="Build an order list and export it as CSV or PDF">Order list</button>
     <button class="btn ghost small" onclick="openExportModal()" title="Export a clean CSV">Export</button>
@@ -2027,18 +2028,100 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 const $ = s => document.querySelector(s);
 
+// ---------- colour helpers ----------
+function hex2rgb(h){
+  h=String(h||"").replace("#","");
+  if(h.length===3) h=h.split("").map(c=>c+c).join("");
+  return [parseInt(h.slice(0,2),16)||0, parseInt(h.slice(2,4),16)||0, parseInt(h.slice(4,6),16)||0];
+}
+function rgb2hex(r){ return "#"+r.map(v=>Math.max(0,Math.min(255,Math.round(v))).toString(16).padStart(2,"0")).join(""); }
+function mix(a,b,t){ const x=hex2rgb(a),y=hex2rgb(b); return rgb2hex(x.map((v,i)=>v+(y[i]-v)*t)); }
+function lum(h){ const [r,g,b]=hex2rgb(h); return (0.299*r+0.587*g+0.114*b)/255; }
+
 // ---------- theme (light / dark) ----------
+const LIGHT_BG_DEFAULT = "#f4f6f9";
+function storedLightBg(){
+  try{ return localStorage.getItem("inv_light_bg") || LIGHT_BG_DEFAULT; }catch(e){ return LIGHT_BG_DEFAULT; }
+}
+
+// Derive a coherent light palette from one background colour, so panels,
+// borders and text stay sensible whatever background is picked.
+function applyLightBackground(bg){
+  const root=document.documentElement;
+  const vars=["--bg","--panel","--panel-2","--line","--text","--muted","--accent-soft"];
+  if(root.getAttribute("data-theme")!=="light"){
+    vars.forEach(v=>root.style.removeProperty(v));   // dark theme keeps its own palette
+    return;
+  }
+  bg = bg || LIGHT_BG_DEFAULT;
+  const dark = lum(bg) < 0.5;                        // someone picked a dark colour
+  const text = dark ? "#f2f5f9" : "#1b2431";
+  root.style.setProperty("--bg", bg);
+  root.style.setProperty("--panel",   dark ? mix(bg,"#ffffff",0.10) : mix(bg,"#ffffff",0.75));
+  root.style.setProperty("--panel-2", dark ? mix(bg,"#ffffff",0.05) : mix(bg,"#000000",0.05));
+  root.style.setProperty("--line",    dark ? mix(bg,"#ffffff",0.16) : mix(bg,"#000000",0.16));
+  root.style.setProperty("--text", text);
+  root.style.setProperty("--muted", mix(text,bg,0.45));
+  root.style.setProperty("--accent-soft", mix("#2f7fd1",bg,0.80));
+}
+
 function applyTheme(t){
   document.documentElement.setAttribute("data-theme", t);
   try{ localStorage.setItem("inv_theme", t); }catch(e){}
   const b=document.getElementById("themeToggle");
   if(b) b.textContent = (t==="light") ? "☀️" : "🌙";
+  applyLightBackground(storedLightBg());
 }
 function toggleTheme(){
   const cur=document.documentElement.getAttribute("data-theme")||"dark";
   applyTheme(cur==="light" ? "dark" : "light");
 }
 applyTheme((function(){ try{ return localStorage.getItem("inv_theme"); }catch(e){ return null; } })() || "dark");
+
+// ---------- appearance ----------
+const LIGHT_PRESETS = [
+  ["Cool grey",  "#f4f6f9"], ["Paper white", "#ffffff"],
+  ["Warm cream", "#faf5ec"], ["Soft sand",   "#f5f1e8"],
+  ["Mint",       "#eef6f1"], ["Sky",         "#eaf2fb"],
+  ["Lavender",   "#f2f0fa"], ["Slate",       "#e7ebf0"],
+];
+
+function openAppearanceModal(){
+  const current = storedLightBg();
+  const isLight = document.documentElement.getAttribute("data-theme")==="light";
+  const body=`
+    ${isLight?"":`<p class="muted">You are in dark mode — switch to light mode with ☀️ to see these take effect.</p>`}
+    <div class="field"><label>Light-mode background</label>
+      <div id="bgPresets" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+        ${LIGHT_PRESETS.map(([n,c])=>`
+          <button class="btn small bgp" data-c="${c}" title="${esc(n)}"
+            style="display:flex;align-items:center;gap:6px">
+            <span style="width:14px;height:14px;border-radius:3px;border:1px solid var(--line);background:${c};display:inline-block"></span>
+            ${esc(n)}</button>`).join("")}
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="color" id="bgCustom" value="${esc(current)}" style="width:52px;height:34px;padding:2px">
+        <span class="muted">custom colour</span>
+        <span class="spacer" style="flex:1"></span>
+        <button class="btn small" id="bgReset">Reset to default</button>
+      </div>
+    </div>
+    <p class="muted">Panels, borders and text are derived from this colour automatically, so the
+    interface stays readable — including if you choose something dark. Dark mode is unaffected.</p>`;
+  const foot=`<button class="btn primary" onclick="closeModal()">Done</button>`;
+  const m=modalShell("Appearance", body, foot);
+  showModal(m);
+
+  const use = c => {
+    try{ localStorage.setItem("inv_light_bg", c); }catch(e){}
+    if(document.documentElement.getAttribute("data-theme")!=="light") applyTheme("light");
+    else applyLightBackground(c);
+    m.querySelector("#bgCustom").value = c;
+  };
+  m.querySelectorAll(".bgp").forEach(b=>b.onclick=()=>use(b.dataset.c));
+  m.querySelector("#bgCustom").oninput=e=>use(e.target.value);
+  m.querySelector("#bgReset").onclick=()=>use(LIGHT_BG_DEFAULT);
+}
 
 let STATE = {tree:[], custom_fields:[], data_dir:"", item_count:0};
 let SELECTED = "";           // selected category path ("" = all)

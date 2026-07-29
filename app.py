@@ -68,7 +68,7 @@ LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -88,6 +88,10 @@ INVENTORY_CSV = "inventory.csv"
 CATEGORIES_CSV = "categories.csv"
 HISTORY_CSV = "history.csv"
 DELETED_CSV = "deleted_items.csv"   # every deleted item is archived here
+ORDER_CSV = "order_list.csv"        # the working "things to order" list
+
+# Shown on order lists and in exports. Change to "$", "CHF", ... as needed.
+CURRENCY = os.environ.get("INVENTORY_CURRENCY", "€")
 
 # Human-readable mirror: one CSV per top-level category, subcategories as
 # labelled sections inside it. inventory.csv stays the master copy.
@@ -153,6 +157,10 @@ def paths():
 
 def deleted_path():
     return get_data_dir() / DELETED_CSV
+
+
+def order_path():
+    return get_data_dir() / ORDER_CSV
 
 
 # ----------------------------------------------------------------------------
@@ -545,6 +553,99 @@ def read_deleted(limit=500):
     return rows[:limit]
 
 
+# ----------------------------------------------------------------------------
+# Order list  (a classic "what to buy" sheet: item, qty, link, price, total)
+# ----------------------------------------------------------------------------
+
+ORDER_COLUMNS = ["item", "quantity", "unit_price", "link", "note"]
+
+
+def parse_number(v):
+    """
+    Read a number the way a person types it: '12', '12.50', '12,50', '1.234,56',
+    '€ 9,99'. Returns a float, or 0.0 when there is nothing usable.
+    """
+    s = re.sub(r"[^\d,.\-]", "", str(v or "").strip())
+    if not s:
+        return 0.0
+    if "," in s and "." in s:
+        # whichever separator comes last is the decimal one
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def money(value):
+    """Format a number as 1234.50 -> '1,234.50'."""
+    try:
+        return f"{float(value):,.2f}"
+    except Exception:
+        return "0.00"
+
+
+def read_order():
+    """Return (rows, total). Each row gains a computed 'line_total'."""
+    f = order_path()
+    rows = []
+    if f.exists():
+        try:
+            with f.open("r", newline="", encoding="utf-8-sig") as fh:
+                for r in csv.DictReader(fh):
+                    rows.append({c: (r.get(c) or "") for c in ORDER_COLUMNS})
+        except Exception:
+            rows = []
+    total = 0.0
+    for r in rows:
+        qty = parse_number(r.get("quantity")) or 0.0
+        price = parse_number(r.get("unit_price"))
+        line = qty * price
+        r["line_total"] = f"{line:.2f}"
+        total += line
+    return rows, total
+
+
+def write_order(rows):
+    """Persist the order list. Rows without an item name are dropped."""
+    f = order_path()
+    clean = []
+    for r in rows or []:
+        item = str(r.get("item") or "").strip()
+        if not item:
+            continue
+        clean.append({c: str(r.get(c) or "").strip() for c in ORDER_COLUMNS})
+    with f.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.DictWriter(fh, fieldnames=ORDER_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(clean)
+    return clean
+
+
+def order_export_rows():
+    """(header, body_rows, total) for a clean order-list export."""
+    rows, total = read_order()
+    header = ["#", "Item", "Quantity", f"Unit price ({CURRENCY})",
+              f"Total ({CURRENCY})", "Link", "Note"]
+    body = []
+    for i, r in enumerate(rows, 1):
+        body.append([
+            str(i),
+            r.get("item", ""),
+            r.get("quantity", ""),
+            money(parse_number(r.get("unit_price"))),
+            money(r.get("line_total", 0)),
+            r.get("link", ""),
+            r.get("note", ""),
+        ])
+    return header, body, total
+
+
 def read_history(limit=500):
     _, _, _, hist = paths()
     if not hist.exists():
@@ -681,6 +782,187 @@ def build_clean_export(category="", include_sub=True, include_dates=True,
             row.append(v)
         out.append(row)
     return header, out
+
+
+# ----------------------------------------------------------------------------
+# Minimal PDF writer
+#
+# Writes a clean one-or-more page order list without any third-party library,
+# so the app keeps working with nothing but Flask installed. Text uses
+# Helvetica; figures use Courier so columns line up exactly when right-aligned.
+# ----------------------------------------------------------------------------
+
+PAGE_W, PAGE_H = 595, 842          # A4 in points
+MARGIN = 40
+
+# Helvetica is proportional; this is a good enough average for truncation.
+_HELV_AVG = 0.52
+_COURIER_W = 0.60                  # Courier is monospaced: exact
+
+
+def _pdf_text(s):
+    """Escape a string for a PDF content stream."""
+    out = str(s if s is not None else "")
+    out = out.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+    return out.replace("\r", " ").replace("\n", " ")
+
+
+def _fit(text, width, size, avg=_HELV_AVG):
+    """Truncate text with an ellipsis so it fits the given width."""
+    text = str(text or "")
+    max_chars = max(1, int(width / (avg * size)))
+    return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
+
+
+def write_order_pdf(path, title, header_note=""):
+    """Render the current order list to a PDF at `path`."""
+    rows, total = read_order()
+
+    # column geometry: right edges for the numeric columns
+    x_num, x_item = MARGIN, MARGIN + 20
+    r_qty, r_unit, r_total = 360, 455, PAGE_W - MARGIN
+    item_w = r_qty - x_item - 45
+
+    pages, annots = [], []
+    lines, page_links = [], []
+
+    def new_page():
+        nonlocal lines, page_links
+        if lines:
+            pages.append(lines)
+            annots.append(page_links)
+        lines, page_links = [], []
+
+    def txt(x, y, s, size=9, font="F1"):
+        lines.append(f"BT /{font} {size} Tf 1 0 0 1 {x:.1f} {y:.1f} Tm "
+                     f"({_pdf_text(s)}) Tj ET")
+
+    def right(x_edge, y, s, size=9, font="F3"):
+        s = str(s)
+        # use the metric that matches the font actually being drawn
+        factor = _COURIER_W if font == "F3" else (0.55 if font == "F2" else _HELV_AVG)
+        txt(x_edge - len(s) * factor * size, y, s, size, font)
+
+    def rule(y, x0=MARGIN, x1=PAGE_W - MARGIN, w=0.5, grey=0.75):
+        lines.append(f"{grey:.2f} G {w} w {x0} {y:.1f} m {x1} {y:.1f} l S 0 G")
+
+    def table_head(y):
+        # the currency is stated once in the footer rather than in every header:
+        # the base-14 fonts advance the euro sign badly in some PDF viewers
+        txt(x_num, y, "#", 8, "F2")
+        txt(x_item, y, "ITEM", 8, "F2")
+        right(r_qty, y, "QTY", 8, "F2")
+        right(r_unit, y, "UNIT PRICE", 8, "F2")
+        right(r_total, y, "TOTAL", 8, "F2")
+        rule(y - 4)
+        return y - 16
+
+    # ---- first page header ----
+    y = PAGE_H - MARGIN
+    txt(MARGIN, y - 6, title, 17, "F2")
+    y -= 26
+    txt(MARGIN, y, datetime.now().strftime("%Y-%m-%d %H:%M"), 9)
+    if header_note:
+        y -= 13
+        txt(MARGIN, y, header_note, 9)
+    y -= 18
+    y = table_head(y)
+
+    for i, r in enumerate(rows, 1):
+        # room needed for this entry (name + optional link/note lines)
+        extra = (13 if r.get("link") else 0) + (13 if r.get("note") else 0)
+        if y - extra < MARGIN + 70:
+            new_page()
+            y = PAGE_H - MARGIN
+            txt(MARGIN, y - 4, f"{title} (continued)", 11, "F2")
+            y -= 22
+            y = table_head(y)
+
+        txt(x_num, y, str(i), 9, "F3")
+        txt(x_item, y, _fit(r.get("item", ""), item_w, 9), 9, "F1")
+        right(r_qty, y, r.get("quantity", "") or "1")
+        right(r_unit, y, money(parse_number(r.get("unit_price"))))
+        right(r_total, y, money(r.get("line_total", 0)))
+
+        if r.get("link"):
+            y -= 12
+            shown = _fit(r["link"], PAGE_W - x_item - MARGIN, 7.5)
+            lines.append("0.20 0.40 0.75 rg")
+            txt(x_item, y, shown, 7.5, "F1")
+            lines.append("0 g")
+            w = len(shown) * _HELV_AVG * 7.5
+            page_links.append((x_item, y - 2, x_item + w, y + 8, r["link"]))
+        if r.get("note"):
+            y -= 12
+            lines.append("0.45 g")
+            txt(x_item, y, _fit(r["note"], PAGE_W - x_item - MARGIN, 7.5), 7.5)
+            lines.append("0 g")
+        y -= 16
+
+    # ---- total ----
+    if y < MARGIN + 60:
+        new_page()
+        y = PAGE_H - MARGIN - 20
+    rule(y + 6, x0=r_unit - 60, w=0.8, grey=0.4)
+    y -= 8
+    txt(x_item, y, "TOTAL", 11, "F2")
+    right(r_total, y, f"{money(total)}", 11, "F3")
+    rule(y - 6, x0=r_unit - 60, w=0.8, grey=0.4)
+    y -= 26
+    lines.append("0.45 g")
+    txt(MARGIN, y, f"{len(rows)} item(s) - all prices in {CURRENCY}", 8)
+    lines.append("0 g")
+    new_page()
+
+    # ---- assemble the file ----
+    objs = {}
+    n_pages = len(pages)
+    font_ids = {"F1": 3 + n_pages * 2, "F2": 4 + n_pages * 2, "F3": 5 + n_pages * 2}
+
+    kids = " ".join(f"{3 + i * 2} 0 R" for i in range(n_pages))
+    objs[1] = "<< /Type /Catalog /Pages 2 0 R >>"
+    objs[2] = f"<< /Type /Pages /Count {n_pages} /Kids [{kids}] >>"
+
+    for i, content in enumerate(pages):
+        pid, cid = 3 + i * 2, 4 + i * 2
+        annot_objs = ""
+        if annots[i]:
+            parts = []
+            for (x0, y0, x1, y1, url) in annots[i]:
+                parts.append(
+                    f"<< /Type /Annot /Subtype /Link /Border [0 0 0] "
+                    f"/Rect [{x0:.1f} {y0:.1f} {x1:.1f} {y1:.1f}] "
+                    f"/A << /Type /Action /S /URI /URI ({_pdf_text(url)}) >> >>")
+            annot_objs = " /Annots [" + " ".join(parts) + "]"
+        objs[pid] = (f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W} {PAGE_H}] "
+                     f"/Resources << /Font << "
+                     f"/F1 {font_ids['F1']} 0 R /F2 {font_ids['F2']} 0 R "
+                     f"/F3 {font_ids['F3']} 0 R >> >> "
+                     f"/Contents {cid} 0 R{annot_objs} >>")
+        stream = "\n".join(content)
+        objs[cid] = ("<< /Length %d >>\nstream\n%s\nendstream"
+                     % (len(stream.encode("cp1252", "replace")) + 1, stream))
+
+    for name, base in (("F1", "Helvetica"), ("F2", "Helvetica-Bold"), ("F3", "Courier")):
+        objs[font_ids[name]] = (f"<< /Type /Font /Subtype /Type1 /BaseFont /{base} "
+                                f"/Encoding /WinAnsiEncoding >>")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = {}
+    for num in sorted(objs):
+        offsets[num] = len(out)
+        out += f"{num} 0 obj\n{objs[num]}\nendobj\n".encode("cp1252", "replace")
+    xref_at = len(out)
+    top = max(objs) + 1
+    out += f"xref\n0 {top}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for num in range(1, top):
+        out += f"{offsets.get(num, 0):010d} 00000 n \n".encode()
+    out += (f"trailer\n<< /Size {top} /Root 1 0 R >>\nstartxref\n"
+            f"{xref_at}\n%%EOF\n").encode()
+
+    Path(path).write_bytes(bytes(out))
+    return len(rows), total
 
 
 def inherited_required_fields(category_path):
@@ -1061,6 +1343,92 @@ def api_deleted():
     with LOCK:
         ensure_files()
         return jsonify({"deleted": read_deleted(), "file": str(deleted_path())})
+
+
+@APP.route("/api/order")
+def api_order_get():
+    with LOCK:
+        ensure_files()
+        rows, total = read_order()
+        return jsonify({"rows": rows, "total": f"{total:.2f}",
+                        "total_display": money(total), "currency": CURRENCY})
+
+
+@APP.route("/api/order", methods=["POST"])
+def api_order_save():
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        saved = write_order(data.get("rows") or [])
+        rows, total = read_order()
+        log_history("order_list", "saved", f"{len(saved)} line(s), total {money(total)}")
+        return jsonify({"ok": True, "rows": rows,
+                        "total_display": money(total), "currency": CURRENCY})
+
+
+@APP.route("/api/order/add", methods=["POST"])
+def api_order_add():
+    """Append one inventory item (or a typed name) to the order list."""
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        name = (data.get("item") or "").strip()
+        if not name:
+            return jsonify({"error": "Item name is required."}), 400
+        rows, _ = read_order()
+        rows.append({"item": name,
+                     "quantity": str(data.get("quantity") or "1"),
+                     "unit_price": str(data.get("unit_price") or ""),
+                     "link": str(data.get("link") or ""),
+                     "note": str(data.get("note") or "")})
+        write_order(rows)
+        rows, total = read_order()
+        return jsonify({"ok": True, "count": len(rows), "total_display": money(total)})
+
+
+@APP.route("/api/order/export", methods=["POST"])
+def api_order_export():
+    """Export the order list as a clean CSV or as a PDF."""
+    with LOCK:
+        ensure_files()
+        data = request.get_json(silent=True) or {}
+        fmt = (data.get("format") or "csv").lower()
+        if fmt not in ("csv", "pdf"):
+            return jsonify({"error": "Unknown format."}), 400
+
+        header, body, total = order_export_rows()
+        if not body:
+            return jsonify({"error": "The order list is empty."}), 400
+
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        default = f"order_list_{stamp}.{fmt}"
+        target = (data.get("path") or "").strip() or pick_save_file_native(default)
+        if not target:
+            return jsonify({"cancelled": True})
+        if not target.lower().endswith("." + fmt):
+            target += "." + fmt
+
+        try:
+            if fmt == "csv":
+                with open(target, "w", newline="", encoding="utf-8-sig") as f:
+                    w = csv.writer(f)
+                    w.writerow(header)
+                    w.writerows(body)
+                    w.writerow([])
+                    w.writerow(["", "TOTAL", "", "", money(total), "", ""])
+                count = len(body)
+            else:
+                count, total = write_order_pdf(
+                    target,
+                    (data.get("title") or "Order list").strip() or "Order list",
+                    (data.get("note") or "").strip())
+        except Exception as e:
+            return jsonify({"error": f"Could not write the file: {e}"}), 400
+
+        log_history("order_export", fmt.upper(),
+                    f"{count} line(s), total {money(total)} -> {target}")
+        return jsonify({"ok": True, "path": target, "count": count,
+                        "total_display": money(total)})
 
 
 @APP.route("/api/export", methods=["POST"])
@@ -1568,6 +1936,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <span class="spacer"></span>
     <button class="btn ghost small" id="themeToggle" onclick="toggleTheme()" title="Toggle light / dark">🌙</button>
     <button class="btn ghost small" onclick="importFile()" title="Import a .csv / .xlsx file — each sheet becomes a subcategory">Import file</button>
+    <button class="btn ghost small" onclick="openOrderModal()" title="Build an order list and export it as CSV or PDF">Order list</button>
     <button class="btn ghost small" onclick="openExportModal()" title="Export a clean CSV">Export</button>
     <button class="btn ghost small" onclick="openHistory()">History</button>
     <button class="btn ghost small" onclick="openDirModal()">Data folder</button>
@@ -1588,6 +1957,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <h2 id="crumb"><span class="crumb">All items</span></h2>
         <span class="spacer" style="flex:1"></span>
         <label class="check"><input type="checkbox" id="includeSub" onchange="loadItems()"> include subcategories</label>
+        <label class="check"><input type="checkbox" id="fillRows" onchange="toggleFillRows()"> fill whole row with colour</label>
         <input class="search" id="search" placeholder="Search…" oninput="debouncedLoad()">
       </div>
       <div class="table-wrap" id="tableWrap"></div>
@@ -1684,6 +2054,22 @@ function renderNode(node){
   return wrap;
 }
 
+// ---------- colour display ----------
+let FILL_ROWS = (function(){ try{ return localStorage.getItem("inv_fill_rows")==="1"; }catch(e){ return false; } })();
+
+// black or white text, whichever stays legible on the given colour
+function readableOn(hex){
+  const h=String(hex||"").replace("#","");
+  if(h.length<6) return "inherit";
+  const r=parseInt(h.slice(0,2),16), g=parseInt(h.slice(2,4),16), b=parseInt(h.slice(4,6),16);
+  return ((0.299*r + 0.587*g + 0.114*b)/255) > 0.6 ? "#111" : "#fff";
+}
+function toggleFillRows(){
+  FILL_ROWS = $("#fillRows").checked;
+  try{ localStorage.setItem("inv_fill_rows", FILL_ROWS?"1":"0"); }catch(e){}
+  loadItems();
+}
+
 // ---------- items ----------
 function debouncedLoad(){clearTimeout(SEARCH_TIMER);SEARCH_TIMER=setTimeout(loadItems,220);}
 
@@ -1717,7 +2103,11 @@ function renderTable(items, customFields){
   items.forEach(it=>{
     const used=(it.status||"")==="used";
     const swatch=it.color?`background:${esc(it.color)}`:"background:transparent";
-    html+=`<tr class="${used?'is-used':''}" onclick='editItem(${JSON.stringify(it.id)})'>`;
+    // colour the whole row, or just the stripe at the start
+    const rowStyle=(FILL_ROWS&&it.color)
+      ? `background:${esc(it.color)};color:${readableOn(it.color)}`
+      : "";
+    html+=`<tr class="${used?'is-used':''}" style="${rowStyle}" onclick='editItem(${JSON.stringify(it.id)})'>`;
     html+=`<td style="padding:0"><div class="swatch" style="${swatch}"></div></td>`;
     cols.forEach(c=>{
       let v=it[c]||"";
@@ -1725,6 +2115,7 @@ function renderTable(items, customFields){
       html+=`<td title="${esc(v)}">${esc(v)}</td>`;
     });
     html+=`<td style="white-space:nowrap">
+           <button class="icon-btn" title="Add to order list" onclick='event.stopPropagation();addToOrder(${JSON.stringify(it.name)})'>🛒</button>
            <button class="icon-btn" title="${used?'Return to stock':'Mark as used'}" onclick='event.stopPropagation();toggleUsed(${JSON.stringify(it.id)},${used?"true":"false"})'>${used?"↩":"✔"}</button>
            <button class="icon-btn" title="Move" onclick='event.stopPropagation();moveItem(${JSON.stringify(it.id)},${JSON.stringify(it.category_path)})'>⇄</button>
            <button class="icon-btn" title="Delete" onclick='event.stopPropagation();deleteItem(${JSON.stringify(it.id)},${JSON.stringify(it.name)})'>🗑</button></td>`;
@@ -1995,6 +2386,143 @@ async function toggleUsed(id,isUsed){
   }catch(e){toast(e.error||"Failed","err");}
 }
 
+// ---------- order list ----------
+let ORDER_ROWS = [];
+
+// Reads numbers the way people type them: 12.50, 12,50, 1.234,56, "€ 9,99".
+// Used for BOTH the line totals and the grand total so they can never disagree.
+function parseNum(v){
+  let s=String(v==null?"":v).replace(/[^\d,.\-]/g,"");
+  if(!s) return 0;
+  if(s.includes(",")&&s.includes(".")) s = s.lastIndexOf(",")>s.lastIndexOf(".")
+    ? s.replace(/\./g,"").replace(",",".") : s.replace(/,/g,"");
+  else if(s.includes(",")) s=s.replace(",",".");
+  const f=parseFloat(s); return isNaN(f)?0:f;
+}
+function lineTotal(r){ return (parseNum(r.quantity)||0) * parseNum(r.unit_price); }
+function orderTotal(){ return ORDER_ROWS.reduce((t,r)=>t + lineTotal(r), 0); }
+function fmtMoney(n){ return n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
+
+async function openOrderModal(){
+  const data = await api("/api/order");
+  ORDER_ROWS = (data.rows||[]).map(r=>({item:r.item,quantity:r.quantity,
+                                        unit_price:r.unit_price,link:r.link,note:r.note}));
+  const cur = data.currency || "";
+  const body = `
+    <p class="muted">A classic order list. Add what you need to buy, then export it as CSV or PDF.</p>
+    <div id="orderTable"></div>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn small" id="ordAdd">+ Add line</button>
+      <button class="btn small" id="ordFromInv">+ From inventory</button>
+    </div>
+    <div id="ordTotal" style="text-align:right;margin-top:14px;font-size:15px;"></div>
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0;">
+    <div class="field"><label>Title on the exported document</label>
+      <input id="ordTitle" value="Order list" placeholder="Order list"></div>
+    <div class="field"><label>Note / reference (optional)</label>
+      <input id="ordNote" placeholder="e.g. Dept. purchase request #12"></div>`;
+  const foot = `<button class="btn ghost" onclick="closeModal()">Close</button>
+    <button class="btn" id="ordSave">Save</button>
+    <button class="btn" id="ordCsv">Export CSV</button>
+    <button class="btn primary" id="ordPdf">Export PDF</button>`;
+  const m = modalShell("Order list", body, foot);
+  m.style.maxWidth = "820px";
+  showModal(m);
+
+  const render = () => {
+    const t = m.querySelector("#orderTable");
+    if(!ORDER_ROWS.length){
+      t.innerHTML = `<p class="muted" style="padding:12px 0">Nothing on the list yet.</p>`;
+    } else {
+      t.innerHTML = `<table style="width:100%;font-size:13px">
+        <thead><tr>
+          <th style="width:26px">#</th><th>Item</th><th style="width:70px">Qty</th>
+          <th style="width:96px">Unit ${esc(cur)}</th><th style="width:92px">Total</th>
+          <th style="width:150px">Link</th><th style="width:26px"></th>
+        </tr></thead><tbody>
+        ${ORDER_ROWS.map((r,i)=>`<tr style="cursor:default">
+          <td>${i+1}</td>
+          <td><input class="oi" data-f="item" data-i="${i}" value="${esc(r.item||"")}" style="width:100%"></td>
+          <td><input class="oi" data-f="quantity" data-i="${i}" value="${esc(r.quantity||"")}" style="width:100%"></td>
+          <td><input class="oi" data-f="unit_price" data-i="${i}" value="${esc(r.unit_price||"")}" style="width:100%" placeholder="0.00"></td>
+          <td class="lt" style="text-align:right;font-variant-numeric:tabular-nums"></td>
+          <td><input class="oi" data-f="link" data-i="${i}" value="${esc(r.link||"")}" style="width:100%" placeholder="https://…"></td>
+          <td><button class="btn danger small" data-del="${i}" title="Remove">✕</button></td>
+        </tr>`).join("")}</tbody></table>`;
+    }
+    // inputs are styled inline to stay compact inside the table
+    t.querySelectorAll("input.oi").forEach(inp=>{
+      inp.style.background="var(--bg)"; inp.style.border="1px solid var(--line)";
+      inp.style.color="var(--text)"; inp.style.borderRadius="5px"; inp.style.padding="5px 7px";
+      inp.style.fontFamily="inherit"; inp.style.fontSize="13px";
+      inp.oninput=()=>{ ORDER_ROWS[+inp.dataset.i][inp.dataset.f]=inp.value; paintTotals(); };
+    });
+    t.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>{
+      ORDER_ROWS.splice(+b.dataset.del,1); render();
+    });
+    paintTotals();
+  };
+
+  const paintTotals = () => {
+    m.querySelectorAll("#orderTable tbody tr").forEach((tr,i)=>{
+      const r=ORDER_ROWS[i]; const cell=tr.querySelector(".lt");
+      if(cell) cell.textContent = fmtMoney(lineTotal(r));
+    });
+    m.querySelector("#ordTotal").innerHTML =
+      `<span class="muted">Total </span><b>${esc(cur)} ${fmtMoney(orderTotal())}</b>`;
+  };
+
+  render();
+
+  m.querySelector("#ordAdd").onclick=()=>{
+    ORDER_ROWS.push({item:"",quantity:"1",unit_price:"",link:"",note:""}); render();
+    const ins=m.querySelectorAll('input[data-f="item"]'); if(ins.length) ins[ins.length-1].focus();
+  };
+
+  m.querySelector("#ordFromInv").onclick=async()=>{
+    const d=await api("/api/items?category=&include_sub=1");
+    const names=(d.items||[]).map(x=>x.name).filter(Boolean).sort();
+    if(!names.length){ toast("No items in the inventory yet","err"); return; }
+    const pick=prompt("Add which item?\n\n"+names.slice(0,40).join(", ")+(names.length>40?" …":""));
+    if(!pick) return;
+    ORDER_ROWS.push({item:pick.trim(),quantity:"1",unit_price:"",link:"",note:""}); render();
+  };
+
+  const save = async () => {
+    const r = await api("/api/order",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({rows:ORDER_ROWS})});
+    return r;
+  };
+  m.querySelector("#ordSave").onclick=async()=>{
+    try{ await save(); toast("Order list saved"); }catch(e){ toast(e.error||"Failed","err"); }
+  };
+
+  const doExport = async (fmt, btn) => {
+    const label=btn.textContent;
+    btn.disabled=true; btn.textContent="Choose a location…";
+    try{
+      await save();                                  // always export what's on screen
+      const r = await api("/api/order/export",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({format:fmt,
+          title:m.querySelector("#ordTitle").value,
+          note:m.querySelector("#ordNote").value})});
+      if(r.cancelled){ btn.disabled=false; btn.textContent=label; return; }
+      toast(`${fmt.toUpperCase()} saved — ${r.count} line(s), total ${r.total_display}`);
+    }catch(e){ toast(e.error||"Export failed","err"); }
+    btn.disabled=false; btn.textContent=label;
+  };
+  m.querySelector("#ordCsv").onclick=e=>doExport("csv", e.target);
+  m.querySelector("#ordPdf").onclick=e=>doExport("pdf", e.target);
+}
+
+async function addToOrder(name){
+  try{
+    const r=await api("/api/order/add",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({item:name,quantity:"1"})});
+    toast(`"${name}" added to the order list (${r.count} line(s))`);
+  }catch(e){ toast(e.error||"Failed","err"); }
+}
+
 // ---------- export ----------
 function openExportModal(){
   const cat=SELECTED;
@@ -2203,6 +2731,7 @@ function openDirModal(){
   };
 }
 
+$("#fillRows").checked = FILL_ROWS;     // restore the colour-display preference
 loadState();
 setTimeout(checkUpdateQuietly, 1500);   // background check, silent if offline
 </script>

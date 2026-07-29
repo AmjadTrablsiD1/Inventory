@@ -36,6 +36,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Used, not deleted** | Mark something as used and record where it went, keeping it in the list |
 | **Delete archive** | Deleted items are saved to `deleted_items.csv` with date, reason and details |
 | **Clean CSV export** | Export just your data, with no internal ids or program columns |
+| **Order list** | Build a purchase list with prices and links, export as CSV or PDF |
 
 ---
 
@@ -106,6 +107,7 @@ InventoryData/
 ├── categories.csv       # the category tree + required fields
 ├── history.csv          # timestamped change log
 ├── deleted_items.csv    # archive of everything you've deleted
+├── order_list.csv       # your working "things to order" list
 └── by_category/         # auto-generated readable view
     ├── _Overview.csv    # index of every category with item counts
     ├── Electronics.csv
@@ -182,7 +184,9 @@ Always try `--dry-run` first on a file you care about — it prints the full map
 
 ## Colours, status and deletion
 
-**Colours.** Every item can carry a colour, set with the picker in the item form (or cleared with **No colour**). It shows as a stripe down the left of the row. Colours also survive an import: if rows or columns in your spreadsheet are filled with a colour, each item keeps it.
+**Colours.** Every item can carry a colour, set with the picker in the item form (or cleared with **No colour**). Colours also survive an import: if rows or columns in your spreadsheet are filled with a colour, each item keeps it.
+
+By default the colour shows as a stripe down the left of the row. Tick **"fill whole row with colour"** in the toolbar to colour the entire row instead — the text automatically switches between black and white so it stays readable on light and dark colours alike. The choice is remembered.
 
 **Used rather than deleted.** When you take something into use, click the **✔** on its row instead of deleting it. You're asked where it went, and the item stays in the inventory marked *Used* — greyed out, with the note and date in the `Status` and `Used for` columns. The **↩** button puts it back in stock. This keeps a truthful record of what you own versus what's in circulation.
 
@@ -200,6 +204,24 @@ Always try `--dry-run` first on a file you care about — it prints the full map
 - whether to include the colour column
 
 You pick where to save it with a normal Save dialog. This is the file to hand to someone else — unlike `inventory.csv`, it carries nothing the program needs internally.
+
+---
+
+## Order lists
+
+**Order list** in the header opens a classic purchase list: **item, quantity, unit price, line total, link** — with the **sum of all prices** at the bottom, updating as you type.
+
+- **+ Add line** for a free-text entry, **+ From inventory** to pick an existing item.
+- The 🛒 button on any inventory row drops it straight onto the list.
+- The list is saved in `order_list.csv`, so it survives restarts.
+- Prices accept whatever you type: `12.50`, `12,50`, `1.234,56` or `€ 9,99` all work.
+
+Export it as:
+
+- **CSV** — clean columns plus a TOTAL row, ready for a spreadsheet.
+- **PDF** — a tidy printable document with your title and reference note, right-aligned figures, clickable links, and the total. It pages automatically for long lists.
+
+The PDF is generated directly by the app, so no extra libraries are needed. Set a different currency with `INVENTORY_CURRENCY` (default `€`).
 
 ---
 
@@ -237,6 +259,7 @@ Everyone running the app sees the update on their next start.
 | `INVENTORY_PORT` | `8765` | Port the local server listens on |
 | `INVENTORY_REPO` | auto-detected | Update source, as `owner/name` |
 | `INVENTORY_BRANCH` | `main` | Branch the updater reads from |
+| `INVENTORY_CURRENCY` | `€` | Currency shown on order lists and exports |
 
 Your chosen data folder is remembered in `~/.inventory_manager_config.json`.
 

@@ -68,7 +68,7 @@ LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -133,10 +133,23 @@ def save_config(cfg):
         pass
 
 
+def env_data_dir():
+    """The data folder pinned by INVENTORY_DIR, if that variable is set."""
+    return (os.environ.get("INVENTORY_DIR") or "").strip()
+
+
 def get_data_dir():
+    """
+    Where the CSVs live. An explicitly set INVENTORY_DIR wins over the folder
+    saved from the UI - otherwise the variable would look like it does nothing
+    once a folder had ever been picked, which makes running a second instance
+    against a different folder impossible.
+    """
+    env = env_data_dir()
+    if env:
+        return Path(env).expanduser()
     cfg = load_config()
-    d = cfg.get("data_dir") or DEFAULT_DIR
-    return Path(d)
+    return Path(cfg.get("data_dir") or DEFAULT_DIR)
 
 
 def set_data_dir(path):
@@ -1197,6 +1210,7 @@ def api_state():
                 "item_count": len(rows),
                 "can_browse": native_picker_available(),
                 "version": APP_VERSION,
+                "dir_from_env": bool(env_data_dir()),
             }
         )
 
@@ -1677,12 +1691,54 @@ def api_import_file():
     with LOCK:
         try:
             import import_data  # imported lazily: import_data imports this module
-            count = import_data.import_file(path)
+            r = import_data.import_file(path, quiet=True)
         except SystemExit as e:
             return jsonify({"error": str(e)}), 400
         except Exception as e:
             return jsonify({"error": f"Import failed: {e}"}), 400
-    return jsonify({"ok": True, "imported": count, "file": Path(path).name})
+    return jsonify({"ok": True, "imported": r["added"], "file": r["file"],
+                    "categories": [c["path"] for c in r["categories"]]})
+
+
+@APP.route("/api/import_folder", methods=["POST"])
+def api_import_folder():
+    """
+    Import every spreadsheet in a folder. With preview=true nothing is written -
+    it just reports what would happen, so a bulk import can be checked first.
+    """
+    data = request.get_json(silent=True) or {}
+    path = (data.get("path") or "").strip()
+    if not path:
+        path = pick_directory_native()
+    if not path:
+        return jsonify({"cancelled": True})
+
+    preview = bool(data.get("preview"))
+    with LOCK:
+        try:
+            import import_data
+            r = import_data.import_folder(
+                path,
+                under=(data.get("under") or "").strip() or None,
+                recursive=bool(data.get("recursive")),
+                dry_run=preview,
+                quiet=True,
+            )
+        except SystemExit as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            return jsonify({"error": f"Import failed: {e}"}), 400
+
+    return jsonify({
+        "ok": True, "preview": preview, "folder": r["folder"],
+        "added": r["added"], "skipped": r.get("skipped", 0),
+        "message": r.get("message", ""),
+        "failed": r.get("failed", []),
+        "files": [{"file": f["file"], "added": f["added"],
+                   "colored": f["colored"],
+                   "categories": [c["path"] for c in f["categories"]]}
+                  for f in r["files"]],
+    })
 
 
 @APP.route("/api/set_dir", methods=["POST"])
@@ -1935,7 +1991,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <button class="version-badge" id="versionBadge" onclick="openUpdateModal()" title="Check for updates"></button>
     <span class="spacer"></span>
     <button class="btn ghost small" id="themeToggle" onclick="toggleTheme()" title="Toggle light / dark">🌙</button>
-    <button class="btn ghost small" onclick="importFile()" title="Import a .csv / .xlsx file — each sheet becomes a subcategory">Import file</button>
+    <button class="btn ghost small" onclick="openImportModal()" title="Import a spreadsheet, or every spreadsheet in a folder">Import</button>
     <button class="btn ghost small" onclick="openOrderModal()" title="Build an order list and export it as CSV or PDF">Order list</button>
     <button class="btn ghost small" onclick="openExportModal()" title="Export a clean CSV">Export</button>
     <button class="btn ghost small" onclick="openHistory()">History</button>
@@ -2672,14 +2728,84 @@ async function openUpdateModal(){
 }
 
 // ---------- import ----------
-async function importFile(){
-  toast("Choose a file in the dialog…");
-  try{
-    const r=await api("/api/import_file",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
-    if(r.cancelled) return;
-    toast(`Imported ${r.imported} item(s) from ${r.file}`);
-    loadState();
-  }catch(e){ toast(e.error||"Import failed","err"); }
+function openImportModal(){
+  const body=`
+    <div class="field"><label>One spreadsheet</label>
+      <p class="muted" style="margin:0 0 8px">Each sheet becomes a subcategory, each row an item.</p>
+      <button class="btn" id="impFile">Choose a file…</button></div>
+    <hr style="border:none;border-top:1px solid var(--line);margin:16px 0;">
+    <div class="field"><label>A whole folder</label>
+      <p class="muted" style="margin:0 0 8px">Imports every .csv, .tsv and .xlsx in the folder —
+      each file becomes its own category. The app's own data files are skipped automatically.</p>
+      <label class="check" style="margin:6px 0"><input type="checkbox" id="impRec"> include subfolders (they become parent categories)</label>
+      <div class="field" style="margin:8px 0 10px"><label>Put everything under one category (optional)</label>
+        <input id="impUnder" placeholder="e.g. Imported 2026"></div>
+      <button class="btn" id="impFolder">Choose a folder…</button></div>
+    <div id="impResult" style="margin-top:14px"></div>`;
+  const foot=`<button class="btn ghost" onclick="closeModal()">Close</button>
+    <button class="btn primary" id="impConfirm" style="display:none">Import all</button>`;
+  const m=modalShell("Import", body, foot);
+  m.style.maxWidth="640px";
+  showModal(m);
+
+  const res=m.querySelector("#impResult");
+  const confirmBtn=m.querySelector("#impConfirm");
+  let pending=null;                  // folder options awaiting confirmation
+
+  m.querySelector("#impFile").onclick=async()=>{
+    res.innerHTML=`<p class="muted">Choose a file in the dialog…</p>`;
+    try{
+      const r=await api("/api/import_file",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      if(r.cancelled){ res.innerHTML=""; return; }
+      res.innerHTML=`<p><b>Imported ${r.imported} item(s)</b> from ${esc(r.file)}</p>
+        <p class="muted">${(r.categories||[]).map(esc).join("<br>")}</p>`;
+      toast(`Imported ${r.imported} item(s)`); loadState();
+    }catch(e){ res.innerHTML=`<p class="muted">${esc(e.error||"Import failed")}</p>`; }
+  };
+
+  m.querySelector("#impFolder").onclick=async()=>{
+    const opts={preview:true,
+                recursive:m.querySelector("#impRec").checked,
+                under:m.querySelector("#impUnder").value.trim()};
+    res.innerHTML=`<p class="muted">Choose a folder in the dialog…</p>`;
+    confirmBtn.style.display="none";
+    try{
+      const r=await api("/api/import_folder",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(opts)});
+      if(r.cancelled){ res.innerHTML=""; return; }
+      if(!r.files.length){
+        res.innerHTML=`<p>${esc(r.message||"Nothing to import in that folder.")}</p>`;
+        return;
+      }
+      pending={...opts, preview:false, path:r.folder};
+      res.innerHTML=`
+        <p><b>${r.files.length} file(s) found</b> in ${esc(r.folder)} —
+           ${r.added} item(s) would be imported.</p>
+        <div style="max-height:220px;overflow:auto;margin-top:8px">
+        ${r.files.map(f=>`<div class="upd-row">
+            <span class="sha">${f.added}×</span>
+            <span>${esc(f.file)}<br><span class="muted">${f.categories.map(esc).join(", ")}
+            ${f.colored?` · ${f.colored} coloured`:""}</span></span></div>`).join("")}
+        </div>
+        ${r.failed&&r.failed.length?`<p class="muted" style="margin-top:8px">Skipped:
+          ${r.failed.map(f=>esc(f.file)).join(", ")}</p>`:""}
+        <p class="muted" style="margin-top:10px">Nothing has been written yet.</p>`;
+      confirmBtn.style.display="";
+    }catch(e){ res.innerHTML=`<p class="muted">${esc(e.error||"Import failed")}</p>`; }
+  };
+
+  confirmBtn.onclick=async()=>{
+    if(!pending) return;
+    confirmBtn.disabled=true; confirmBtn.textContent="Importing…";
+    try{
+      const r=await api("/api/import_folder",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(pending)});
+      res.innerHTML=`<p><b>Imported ${r.added} item(s)</b> from ${r.files.length} file(s).</p>`;
+      toast(`Imported ${r.added} item(s) from ${r.files.length} file(s)`);
+      confirmBtn.style.display="none"; pending=null; loadState();
+    }catch(e){ res.innerHTML=`<p class="muted">${esc(e.error||"Import failed")}</p>`; }
+    confirmBtn.disabled=false; confirmBtn.textContent="Import all";
+  };
 }
 
 // ---------- history ----------
@@ -2708,7 +2834,9 @@ function openDirModal(){
       ${canBrowse?`<button class="btn" id="browseBtn" type="button" style="white-space:nowrap;">Browse…</button>`:``}
     </div></div>
     <p class="muted">Files stored here: inventory.csv, categories.csv, history.csv — all openable in Excel.
-    Pick an empty folder and your current data is copied there automatically.</p>`;
+    Pick an empty folder and your current data is copied there automatically.</p>
+    ${STATE.dir_from_env?`<p class="muted" style="color:var(--accent)">Note: the folder is currently
+    fixed by the INVENTORY_DIR environment variable, which overrides this setting for as long as it is set.</p>`:""}`;
   const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
     <button class="btn primary" id="saveDir">Use this folder</button>`;
   const m=modalShell("Data folder", body, foot); showModal(m);

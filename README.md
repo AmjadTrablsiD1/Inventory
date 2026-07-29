@@ -37,6 +37,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Delete archive** | Deleted items are saved to `deleted_items.csv` with date, reason and details |
 | **Clean CSV export** | Export just your data, with no internal ids or program columns |
 | **Order list** | Build a purchase list with prices and links, export as CSV or PDF |
+| **Bulk import** | Import every spreadsheet in a folder at once, with a preview first |
 
 ---
 
@@ -165,7 +166,27 @@ python3 import_data.py Warehouse.xlsx --sheet Tools
 
 # No arguments → opens a file picker
 python3 import_data.py
+
+# A whole FOLDER: imports every .csv / .tsv / .xlsx inside it
+python3 import_data.py ~/Documents/inventory-sheets
+
+# ...including subfolders, which become parent categories
+python3 import_data.py ~/Documents/inventory-sheets --recursive
+
+# ...all nested under one category
+python3 import_data.py ~/Documents/inventory-sheets --under "Imported 2026"
 ```
+
+### Importing a whole folder
+
+**Import** in the header offers both: a single file, or **a whole folder**. Folder import takes every `.csv`, `.tsv` and `.xlsx` in the folder and makes each file its own category.
+
+- **Include subfolders** mirrors the folder tree as categories: `Lab2/measuring.csv` becomes `Lab2/measuring`.
+- **Put everything under one category** nests the whole import beneath a name you choose.
+- You always get a **preview first** — every file, how many items it would add, and which categories it would create. Nothing is written until you press **Import all**.
+- The app's own files (`inventory.csv`, `categories.csv`, `history.csv`, `deleted_items.csv`, `order_list.csv` and the generated `by_category/` mirror) are **skipped automatically**, so pointing it at your own data folder can't duplicate your inventory. Excel lock files (`~$…`) and hidden files are skipped too.
+
+From the command line, pass a folder instead of a file — add `--dry-run` to preview.
 
 You can also click **Import file** in the app header to do the same thing through a dialog.
 
@@ -255,7 +276,7 @@ Everyone running the app sees the update on their next start.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `INVENTORY_DIR` | `~/InventoryData` | Where the CSV files are stored |
+| `INVENTORY_DIR` | `~/InventoryData` | Where the CSV files are stored. When set, it overrides the folder picked in the app — handy for running a second instance against different data |
 | `INVENTORY_PORT` | `8765` | Port the local server listens on |
 | `INVENTORY_REPO` | auto-detected | Update source, as `owner/name` |
 | `INVENTORY_BRANCH` | `main` | Branch the updater reads from |

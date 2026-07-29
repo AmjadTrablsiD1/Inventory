@@ -231,7 +231,14 @@ def row_to_item(row, name_col, qty_col):
 # Import
 # ---------------------------------------------------------------------------
 
-def import_file(path, base_category=None, only_sheet=None, dry_run=False):
+def import_file(path, base_category=None, only_sheet=None, dry_run=False,
+                parent=None, quiet=False):
+    """
+    Import one spreadsheet. Returns a summary dict.
+
+    base_category replaces the file name as the top category; `parent` instead
+    keeps the file name and nests it, giving Parent/FileName[/Sheet].
+    """
     path = Path(path).expanduser()
     if not path.exists():
         raise SystemExit(f"File not found: {path}")
@@ -242,7 +249,11 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False):
         if not sheets:
             raise SystemExit(f"No sheet named '{only_sheet}' in {path.name}.")
 
-    top = (base_category or path.stem).strip().replace("/", "-")
+    if base_category:
+        top = base_category.strip().strip("/")
+    else:
+        stem = path.stem.strip().replace("/", "-")
+        top = f"{parent.strip().strip('/')}/{stem}" if parent else stem
     single_sheet_csv = path.suffix.lower() in (".csv", ".tsv", ".txt")
 
     inv.ensure_files()
@@ -294,43 +305,161 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False):
                         [h for h in header if h not in (name_col, qty_col)],
                         colored))
 
+    result = {
+        "file": path.name,
+        "path": str(path),
+        "top": top,
+        "added": added_total,
+        "colored": sum(s[5] for s in summary),
+        "categories": [{"path": s[0], "items": s[1], "name_from": s[2],
+                        "quantity_from": s[3], "extra_fields": s[4],
+                        "colored": s[5]} for s in summary],
+        "saved": False,
+    }
+
     # ---- report ----
-    print()
-    print("=" * 66)
-    print(f"  {'DRY RUN - nothing written' if dry_run else 'Importing'}: {path.name}")
-    print("=" * 66)
-    print(f"  Category      : {top}")
-    print(f"  Data folder   : {inv.get_data_dir()}")
-    print()
-    for cat_path, count, name_col, qty_col, extras, colored in summary:
-        print(f"  {cat_path}")
-        print(f"      items       : {count}")
-        print(f"      name from   : {name_col or '(first non-empty column)'}")
-        print(f"      quantity    : {qty_col or '(defaults to 1)'}")
-        if extras:
-            shown = ", ".join(extras[:8]) + (" ..." if len(extras) > 8 else "")
-            print(f"      extra fields: {shown}")
-        if colored:
-            print(f"      colours kept: {colored} row(s)")
+    if not quiet:
         print()
-    print(f"  Total items: {added_total}")
-    print("=" * 66)
+        print("=" * 66)
+        print(f"  {'DRY RUN - nothing written' if dry_run else 'Importing'}: {path.name}")
+        print("=" * 66)
+        print(f"  Category      : {top}")
+        print(f"  Data folder   : {inv.get_data_dir()}")
+        print()
+        for cat_path, count, name_col, qty_col, extras, colored in summary:
+            print(f"  {cat_path}")
+            print(f"      items       : {count}")
+            print(f"      name from   : {name_col or '(first non-empty column)'}")
+            print(f"      quantity    : {qty_col or '(defaults to 1)'}")
+            if extras:
+                shown = ", ".join(extras[:8]) + (" ..." if len(extras) > 8 else "")
+                print(f"      extra fields: {shown}")
+            if colored:
+                print(f"      colours kept: {colored} row(s)")
+            print()
+        print(f"  Total items: {added_total}")
+        print("=" * 66)
 
     if dry_run:
-        print("  Nothing was saved. Re-run without --dry-run to import.\n")
-        return added_total
+        if not quiet:
+            print("  Nothing was saved. Re-run without --dry-run to import.\n")
+        return result
 
     if added_total == 0:
-        print("  No rows with usable data were found - nothing imported.\n")
-        return 0
+        if not quiet:
+            print("  No rows with usable data were found - nothing imported.\n")
+        return result
 
     inv.write_categories(cat_map, sync_view=False)
     inv.write_inventory(rows, custom)          # this rebuilds by_category/ too
     inv.log_history("import_file", top,
                     f"{path.name}: {added_total} items into "
                     f"{len(summary)} categor{'y' if len(summary)==1 else 'ies'}")
-    print(f"  Saved. Open the app to see them under '{top}'.\n")
-    return added_total
+    if not quiet:
+        print(f"  Saved. Open the app to see them under '{top}'.\n")
+    result["saved"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Folder import: every spreadsheet in a folder, in one go
+# ---------------------------------------------------------------------------
+
+FOLDER_SUFFIXES = {".csv", ".tsv", ".xlsx", ".xlsm"}
+
+
+def _is_app_generated(p):
+    """True for the app's own data files, so a data folder can't re-import itself."""
+    if p.name in {inv.INVENTORY_CSV, inv.CATEGORIES_CSV, inv.HISTORY_CSV,
+                  inv.DELETED_CSV, inv.ORDER_CSV, "_Overview.csv"}:
+        return True
+    if p.suffix.lower() in (".csv", ".tsv"):
+        try:
+            with p.open("r", encoding="utf-8-sig", errors="replace") as f:
+                if f.readline().startswith(inv.HIER_MARKER[:30]):
+                    return True      # a by_category/ mirror file
+        except Exception:
+            pass
+    return False
+
+
+def find_importable(folder, recursive=False):
+    """Spreadsheets in `folder` worth importing, sorted, app files excluded."""
+    folder = Path(folder).expanduser()
+    it = folder.rglob("*") if recursive else folder.glob("*")
+    found = []
+    for p in sorted(it):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in FOLDER_SUFFIXES:
+            continue
+        if p.name.startswith(("~$", ".")):
+            continue                      # Excel lock files, hidden files
+        if _is_app_generated(p):
+            continue
+        found.append(p)
+    return found
+
+
+def import_folder(folder, under=None, recursive=False, dry_run=False,
+                  mirror_subfolders=True, quiet=False):
+    """
+    Import every spreadsheet in a folder. Each file becomes its own category
+    (named after the file); with `under` they all nest beneath that name. When
+    recursing, subfolders become parent categories.
+    """
+    folder = Path(folder).expanduser()
+    if not folder.is_dir():
+        raise SystemExit(f"Not a folder: {folder}")
+
+    files = find_importable(folder, recursive)
+    if not files:
+        return {"folder": str(folder), "files": [], "added": 0, "skipped": 0,
+                "message": "No .csv/.tsv/.xlsx files to import were found there."}
+
+    if not quiet:
+        print()
+        print("=" * 66)
+        print(f"  {'DRY RUN - nothing written' if dry_run else 'Folder import'}: {folder}")
+        print(f"  {len(files)} file(s) found")
+        print("=" * 66)
+
+    results, total, failed = [], 0, []
+    for f in files:
+        # subfolder path becomes a parent category when recursing
+        parent = under or None
+        if recursive and mirror_subfolders:
+            rel = f.parent.relative_to(folder)
+            if str(rel) != ".":
+                sub = "/".join(p.replace("/", "-") for p in rel.parts)
+                parent = f"{under}/{sub}" if under else sub
+        try:
+            r = import_file(f, parent=parent, dry_run=dry_run, quiet=True)
+            results.append(r)
+            total += r["added"]
+            if not quiet:
+                cats = ", ".join(c["path"] for c in r["categories"]) or "-"
+                col = f", {r['colored']} coloured" if r["colored"] else ""
+                print(f"  {f.name:<34} {r['added']:>5} item(s){col}")
+                print(f"  {'':<34} -> {cats}")
+        except SystemExit as e:
+            failed.append({"file": f.name, "error": str(e)})
+            if not quiet:
+                print(f"  {f.name:<34}   SKIPPED: {e}")
+
+    if not quiet:
+        print("=" * 66)
+        print(f"  Total: {total} item(s) from {len(results)} file(s)"
+              + (f", {len(failed)} skipped" if failed else ""))
+        if dry_run:
+            print("  Nothing was saved. Re-run without --dry-run to import.")
+        print()
+
+    if not dry_run and total:
+        inv.log_history("import_folder", str(folder),
+                        f"{total} items from {len(results)} file(s)")
+    return {"folder": str(folder), "files": results, "failed": failed,
+            "added": total, "skipped": len(failed)}
 
 
 def pick_file_dialog():
@@ -346,11 +475,16 @@ def pick_file_dialog():
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Import a spreadsheet into the Inventory app "
-                    "(file -> category, sheet -> subcategory, row -> item).")
-    ap.add_argument("file", nargs="?", help="path to a .csv / .xlsx file")
+        description="Import spreadsheets into the Inventory app "
+                    "(file -> category, sheet -> subcategory, row -> item). "
+                    "Give it a FOLDER to import every spreadsheet inside it.")
+    ap.add_argument("file", nargs="?",
+                    help="path to a .csv / .xlsx file, or a folder of them")
     ap.add_argument("--category", help="import under this category name")
-    ap.add_argument("--sheet", help="import only this sheet")
+    ap.add_argument("--sheet", help="import only this sheet (single file only)")
+    ap.add_argument("--under", help="folder import: nest everything under this category")
+    ap.add_argument("--recursive", action="store_true",
+                    help="folder import: include subfolders, mirroring them as categories")
     ap.add_argument("--dry-run", action="store_true",
                     help="preview the import without saving")
     args = ap.parse_args()
@@ -359,8 +493,13 @@ def main():
     if not target:
         ap.print_help()
         return 1
-    import_file(target, base_category=args.category,
-                only_sheet=args.sheet, dry_run=args.dry_run)
+
+    if Path(target).expanduser().is_dir():
+        import_folder(target, under=args.under or args.category,
+                      recursive=args.recursive, dry_run=args.dry_run)
+    else:
+        import_file(target, base_category=args.category,
+                    only_sheet=args.sheet, dry_run=args.dry_run)
     return 0
 
 

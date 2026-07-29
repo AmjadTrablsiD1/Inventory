@@ -68,7 +68,7 @@ LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -735,12 +735,19 @@ def github_repo():
     return DEFAULT_REPO
 
 
-def _gh_get(url, timeout=15, raw=False):
-    """GET from GitHub over HTTPS. Returns parsed JSON, bytes, or None."""
+def _gh_get(url, timeout=15, raw=False, accept=None):
+    """
+    GET from GitHub over HTTPS. Returns parsed JSON or bytes.
+
+    The Accept header matters: the zipball/archive endpoint answers 415 for
+    'application/octet-stream', so binary downloads ask for '*/*'.
+    """
     import urllib.request
+    if accept is None:
+        accept = "*/*" if raw else "application/vnd.github+json"
     req = urllib.request.Request(url, headers={
         "User-Agent": f"InventoryManager/{APP_VERSION}",
-        "Accept": "application/octet-stream" if raw else "application/vnd.github+json",
+        "Accept": accept,
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = resp.read()
@@ -794,12 +801,34 @@ def apply_update():
     import zipfile
     import tempfile
 
+    # fail fast and clearly if we could never write the files anyway
+    probe = APP_DIR / ".update_write_test"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except Exception:
+        return False, (f"The program folder is not writable:\n{APP_DIR}\n\n"
+                       "Move the app somewhere you own (for example your home "
+                       "folder) and try again."), {}
+
     repo = github_repo()
     url = f"https://api.github.com/repos/{repo}/zipball/{UPDATE_BRANCH}"
     try:
         blob = _gh_get(url, timeout=120, raw=True)
     except Exception as e:
-        return False, f"Could not download the update: {e}", {}
+        code = getattr(e, "code", None)
+        hint = ""
+        if code == 404:
+            hint = (f" The repository or branch was not found - check that "
+                    f"'{repo}' exists and has a '{UPDATE_BRANCH}' branch.")
+        elif code == 403:
+            hint = (" GitHub is rate-limiting this machine (60 requests per hour "
+                    "without a login). Wait a while and try again.")
+        elif code == 401:
+            hint = " The repository appears to be private."
+        elif isinstance(e, OSError) and code is None:
+            hint = " Check your internet connection."
+        return False, f"Could not download the update: {e}.{hint}", {}
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(blob))

@@ -68,7 +68,7 @@ LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -1667,6 +1667,10 @@ def api_category_delete():
             ), 409
 
         if mode == "recursive":
+            # archive them exactly like a normal delete, so nothing vanishes
+            # without a record
+            for t in affected:
+                archive_deleted(t, f"category '{path}' deleted")
             affected_ids = {r.get("id") for r in affected}
             rows = [r for r in rows if r.get("id") not in affected_ids]
             write_inventory(rows, custom)
@@ -2421,14 +2425,26 @@ async function bulkColor(){
 }
 async function bulkDelete(){
   const n=SELECTED_IDS.size;
-  const reason=prompt(`Delete ${n} item(s)?\n\nThey are archived in deleted_items.csv.\nOptionally note why:`);
+  const names=(LAST_ITEMS||[]).filter(i=>SELECTED_IDS.has(i.id)).map(i=>i.name);
+  const reason=await askText({
+    title:`Delete ${n} item(s)?`,
+    message:`${esc(names.slice(0,6).join(", "))}${names.length>6?` +${names.length-6} more`:""}<br>`
+           +`They are archived in deleted_items.csv and can be reviewed later.`,
+    label:"Reason (optional)", placeholder:"e.g. broken, returned, sold",
+    okLabel:"Delete"});
   if(reason===null) return;
   bulk({action:"delete",reason}, "Deleted and archived");
 }
 async function bulkUsed(back){
+  if(!SELECTED_IDS.size) return;
   let note="";
-  if(!back){
-    note=prompt(`Mark ${SELECTED_IDS.size} item(s) as used.\n\nWhere are they used / who has them?`);
+  if(back){
+    if(!await askConfirm({title:"Back in stock",
+      message:`Put ${SELECTED_IDS.size} item(s) back in stock?`, okLabel:"Yes"})) return;
+  }else{
+    note=await askText({title:`Mark ${SELECTED_IDS.size} item(s) as used`,
+      label:"Used for / where", placeholder:"e.g. installed in Lab 2 / given to Ahmed",
+      okLabel:"Mark used"});
     if(note===null) return;
   }
   bulk({action:"status",status:back?"":"used",used_note:note}, back?"Back in stock":"Marked as used");
@@ -2436,7 +2452,8 @@ async function bulkUsed(back){
 async function renameSelected(){
   const id=selectedIds()[0]; if(!id) return;
   const it=(LAST_ITEMS||[]).find(x=>x.id===id);
-  const nn=prompt("Rename item:", it?it.name:"");
+  const nn=await askText({title:"Rename item", label:"New name",
+                          value:it?it.name:"", okLabel:"Rename"});
   if(nn===null || !nn.trim()) return;
   bulk({action:"rename",name:nn.trim()}, "Renamed");
 }
@@ -2591,8 +2608,64 @@ function renderTable(items, customFields){
 }
 
 // ---------- modal infra ----------
-function showModal(node){const o=$("#overlay");o.innerHTML="";o.appendChild(node);o.classList.add("show");}
-function closeModal(){$("#overlay").classList.remove("show");$("#overlay").innerHTML="";}
+// Modals can stack: a small ask-dialog opened on top of a bigger modal
+// restores it (the same DOM node, so its handlers survive) when it closes.
+let MODAL_STACK=[];
+function showModal(node, stack){
+  const o=$("#overlay");
+  if(stack && o.classList.contains("show") && o.firstChild) MODAL_STACK.push(o.firstChild);
+  o.innerHTML=""; o.appendChild(node); o.classList.add("show");
+}
+function closeModal(){
+  const o=$("#overlay");
+  if(MODAL_STACK.length){ o.innerHTML=""; o.appendChild(MODAL_STACK.pop()); return; }
+  o.classList.remove("show"); o.innerHTML="";
+}
+
+// ---------- in-app replacements for prompt() / confirm() ----------
+// Browsers can block or ignore the native dialogs entirely, which silently
+// cancelled every action that relied on them. These always work.
+function askText(opts){
+  return new Promise(resolve=>{
+    const o=opts||{};
+    const field = o.options
+      ? `<select id="askInput">${o.options.map(v=>
+            `<option value="${esc(v)}" ${v===o.value?"selected":""}>${esc(v)}</option>`).join("")}</select>`
+      : `<input id="askInput" value="${esc(o.value||"")}" placeholder="${esc(o.placeholder||"")}">`;
+    const body=`${o.message?`<p class="muted">${o.message}</p>`:""}
+      <div class="field"><label>${esc(o.label||"")}</label>${field}</div>`;
+    const m=modalShell(o.title||"", body,
+      `<button class="btn ghost" id="askCancel">Cancel</button>
+       <button class="btn primary" id="askOk">${esc(o.okLabel||"OK")}</button>`);
+    let done=false;
+    const finish=v=>{ if(done)return; done=true; closeModal(); resolve(v); };
+    showModal(m, true);
+    const input=m.querySelector("#askInput");
+    input.focus(); if(input.select) input.select();
+    input.onkeydown=e=>{
+      if(e.key==="Enter"){ e.preventDefault(); finish(input.value); }
+      if(e.key==="Escape"){ e.preventDefault(); finish(null); }
+    };
+    m.querySelector("#askOk").onclick=()=>finish(input.value);
+    m.querySelector("#askCancel").onclick=()=>finish(null);
+    m.querySelector(".m-head .icon-btn").onclick=()=>finish(null);
+  });
+}
+function askConfirm(opts){
+  return new Promise(resolve=>{
+    const o=opts||{};
+    const m=modalShell(o.title||"Please confirm", `<p>${o.message||""}</p>`,
+      `<button class="btn ghost" id="askNo">${esc(o.cancelLabel||"Cancel")}</button>
+       <button class="btn ${o.danger?"danger":"primary"}" id="askYes">${esc(o.okLabel||"OK")}</button>`);
+    let done=false;
+    const finish=v=>{ if(done)return; done=true; closeModal(); resolve(v); };
+    showModal(m, true);
+    m.querySelector("#askYes").onclick=()=>finish(true);
+    m.querySelector("#askNo").onclick=()=>finish(false);
+    m.querySelector(".m-head .icon-btn").onclick=()=>finish(false);
+    m.querySelector("#askYes").focus();
+  });
+}
 $("#overlay").addEventListener("click",e=>{if(e.target===$("#overlay"))closeModal();});
 
 function modalShell(title, bodyHtml, footHtml){
@@ -2604,8 +2677,11 @@ function modalShell(title, bodyHtml, footHtml){
 
 // ---------- categories ----------
 async function addCategory(parent){
-  const name=prompt(parent?`New subcategory under "${parent}":`:"New top-level category:");
-  if(!name) return;
+  const name=await askText({
+    title: parent?"New subcategory":"New category",
+    message: parent?`It will be created under <b>${esc(parent)}</b>.`:"",
+    label:"Category name", placeholder:"e.g. Electronics", okLabel:"Create"});
+  if(!name || !name.trim()) return;
   try{ await api("/api/category",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({parent,name:name.trim()})});
     if(parent)EXPANDED.add(parent);
@@ -2613,8 +2689,9 @@ async function addCategory(parent){
   }catch(e){toast(e.error||"Failed","err");}
 }
 async function renameCategory(node){
-  const nn=prompt("Rename category:",node.name);
-  if(!nn||nn===node.name) return;
+  const nn=await askText({title:"Rename category", label:"New name",
+                          value:node.name, okLabel:"Rename"});
+  if(!nn||!nn.trim()||nn===node.name) return;
   try{ await api("/api/category/rename",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({path:node.path,new_name:nn.trim()})});
     toast("Renamed"); loadState();
@@ -2627,7 +2704,12 @@ async function deleteCategory(node){
     toast("Category deleted"); if(SELECTED===node.path)SELECTED=""; loadState();
   }catch(e){
     if(e.error==="not_empty"){
-      const go=confirm(`"${node.name}" and its subcategories contain ${e.count} item(s).\n\nOK = delete category AND all its items.\nCancel = keep everything.`);
+      const go=await askConfirm({
+        title:"Category is not empty",
+        message:`<b>${esc(node.name)}</b> and its subcategories contain <b>${e.count}</b> item(s).`
+               +`<br><br>Deleting the category will delete those items too. They are archived in `
+               +`deleted_items.csv first.`,
+        okLabel:`Delete category and ${e.count} item(s)`, cancelLabel:"Keep everything", danger:true});
       if(!go) return;
       try{
         await api("/api/category/delete",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -2830,7 +2912,11 @@ async function buildItemModal(item){
 }
 
 async function deleteItem(id,name){
-  const reason=prompt(`Delete "${name||"this item"}"?\n\nIt will be archived in deleted_items.csv.\nOptionally note why (leave blank to just delete):`);
+  const reason=await askText({
+    title:"Delete item",
+    message:`<b>${esc(name||"this item")}</b> will be archived in deleted_items.csv before it is removed.`,
+    label:"Reason (optional)", placeholder:"e.g. broken, returned, sold",
+    okLabel:"Delete"});
   if(reason===null) return;      // cancelled
   try{await api("/api/item/delete",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({id,reason})});
@@ -2841,9 +2927,11 @@ async function deleteItem(id,name){
 async function toggleUsed(id,isUsed){
   let note="";
   if(!isUsed){
-    note=prompt("Mark as used.\n\nWhere is it used / who has it?");
+    note=await askText({title:"Mark as used", label:"Used for / where",
+      placeholder:"e.g. installed in Lab 2 / given to Ahmed", okLabel:"Mark used"});
     if(note===null) return;
-  }else if(!confirm("Put this item back in stock?")) return;
+  }else if(!await askConfirm({title:"Back in stock",
+      message:"Put this item back in stock?", okLabel:"Yes"})) return;
   try{
     await api("/api/item/status",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({id,status:isUsed?"":"used",used_note:note})});
@@ -2948,7 +3036,8 @@ async function openOrderModal(){
     const d=await api("/api/items?category=&include_sub=1");
     const names=(d.items||[]).map(x=>x.name).filter(Boolean).sort();
     if(!names.length){ toast("No items in the inventory yet","err"); return; }
-    const pick=prompt("Add which item?\n\n"+names.slice(0,40).join(", ")+(names.length>40?" …":""));
+    const pick=await askText({title:"Add from inventory", label:"Item",
+                              options:names, value:names[0], okLabel:"Add"});
     if(!pick) return;
     ORDER_ROWS.push({item:pick.trim(),quantity:"1",unit_price:"",link:"",note:""}); render();
   };

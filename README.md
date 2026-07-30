@@ -30,6 +30,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Light & dark mode** | Toggle in the header, remembered across restarts |
 | **Custom background** | Choose the light-mode background from presets or any colour |
 | **Multi-select & right-click** | Select many rows and move, recolour, mark used or delete in one go |
+| **Column management** | Rename, reorder, hide or delete columns — including junk from imports |
 | **Choose your data folder** | Native folder picker; data is copied along when you switch |
 | **Readable CSV mirror** | One CSV per category, subcategories as labelled sections |
 | **Spreadsheet importer** | Feed it an `.xlsx` or `.csv` and it maps sheets → subcategories |
@@ -212,6 +213,21 @@ Always try `--dry-run` first on a file you care about — it prints the full map
 **Right-click** any row for the same actions as a context menu. Right-clicking inside a selection acts on the whole selection; right-clicking outside it selects that one row first. The **⋯** button on each row opens the same menu if you prefer clicking.
 
 **Nothing runs away from you.** The checkbox and item name are pinned to the left of the table and the action buttons are pinned to the right, so no matter how many custom columns you have or how far you scroll sideways, you can always see which row you are about to act on.
+
+---
+
+## Managing columns
+
+Imported spreadsheets often arrive with unhelpful headings like `333`, or columns you simply don't need. **Right-click any column heading** (or click the **⋯** that appears when you hover it, or use the **Columns** button in the toolbar) to:
+
+- **Rename** it — for a column that came from your data this really renames the field, in the CSV header and on every item, and updates any category that required it. For a built-in column such as *Category* or *Used for* only the heading you see changes; the underlying field keeps its name so nothing else breaks.
+- **Move left / Move right** to reorder.
+- **Hide** it — the column disappears from the table but the data stays in the file, so you can bring it back any time.
+- **Delete** it — only offered for columns that came from your data. It removes that field from every item and from the CSV, and tells you how many items hold data in it first.
+
+The **Columns** dialog lists everything at once with tick boxes for visibility and arrows for order. Settings live in `column_settings.json` next to your data, so they travel with the folder rather than being stuck in one browser.
+
+> The *Name* column can't be hidden or moved — it stays pinned to the left as your anchor for every row.
 
 ---
 

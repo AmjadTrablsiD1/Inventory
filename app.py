@@ -68,7 +68,7 @@ LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -89,6 +89,7 @@ CATEGORIES_CSV = "categories.csv"
 HISTORY_CSV = "history.csv"
 DELETED_CSV = "deleted_items.csv"   # every deleted item is archived here
 ORDER_CSV = "order_list.csv"        # the working "things to order" list
+COLUMNS_JSON = "column_settings.json"   # per-folder column order/labels/hidden
 
 # Shown on order lists and in exports. Change to "$", "CHF", ... as needed.
 CURRENCY = os.environ.get("INVENTORY_CURRENCY", "€")
@@ -174,6 +175,101 @@ def deleted_path():
 
 def order_path():
     return get_data_dir() / ORDER_CSV
+
+
+# ----------------------------------------------------------------------------
+# Column settings: which columns show, in what order, under what heading.
+# Stored beside the data so they travel with it.
+# ----------------------------------------------------------------------------
+
+def read_col_settings():
+    f = get_data_dir() / COLUMNS_JSON
+    out = {"labels": {}, "hidden": [], "order": []}
+    if f.exists():
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            for k in out:
+                if k in data and isinstance(data[k], type(out[k])):
+                    out[k] = data[k]
+        except Exception:
+            pass
+    return out
+
+
+def write_col_settings(s):
+    try:
+        (get_data_dir() / COLUMNS_JSON).write_text(
+            json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def rename_custom_field(old, new):
+    """Rename a custom column everywhere: the CSV header, every row, and any
+    category that lists it as a required field."""
+    rows, custom = read_inventory()
+    if old in BASE_COLUMNS:
+        return False, "That is a built-in column - you can rename its heading, but not the field itself."
+    if old not in custom:
+        return False, f"There is no column called '{old}'."
+    new = sanitize_field_name(new)
+    if not new:
+        return False, "A name is required."
+    if new == old:
+        return True, ""
+    if new in BASE_COLUMNS or new in custom:
+        return False, f"A column called '{new}' already exists."
+
+    custom[custom.index(old)] = new
+    for r in rows:
+        r[new] = r.pop(old, "")
+    write_inventory(rows, custom)
+
+    cat_map = read_categories()
+    if any(old in v for v in cat_map.values()):
+        for k, v in cat_map.items():
+            cat_map[k] = [new if x == old else x for x in v]
+        write_categories(cat_map)
+
+    s = read_col_settings()
+    s["hidden"] = [new if c == old else c for c in s["hidden"]]
+    s["order"] = [new if c == old else c for c in s["order"]]
+    if old in s["labels"]:
+        s["labels"][new] = s["labels"].pop(old)
+    write_col_settings(s)
+
+    log_history("rename_column", old, f"-> {new}")
+    return True, ""
+
+
+def delete_custom_field(name):
+    """Remove a custom column and its data from every item."""
+    rows, custom = read_inventory()
+    if name in BASE_COLUMNS:
+        return False, "Built-in columns cannot be deleted - hide it instead."
+    if name not in custom:
+        return False, f"There is no column called '{name}'."
+
+    filled = sum(1 for r in rows if str(r.get(name, "")).strip())
+    custom.remove(name)
+    for r in rows:
+        r.pop(name, None)
+    write_inventory(rows, custom)
+
+    cat_map = read_categories()
+    if any(name in v for v in cat_map.values()):
+        for k, v in cat_map.items():
+            cat_map[k] = [x for x in v if x != name]
+        write_categories(cat_map)
+
+    s = read_col_settings()
+    s["hidden"] = [c for c in s["hidden"] if c != name]
+    s["order"] = [c for c in s["order"] if c != name]
+    s["labels"].pop(name, None)
+    write_col_settings(s)
+
+    log_history("delete_column", name, f"removed from {filled} item(s)")
+    return True, ""
 
 
 # ----------------------------------------------------------------------------
@@ -1211,6 +1307,7 @@ def api_state():
                 "can_browse": native_picker_available(),
                 "version": APP_VERSION,
                 "dir_from_env": bool(env_data_dir()),
+                "columns": read_col_settings(),
             }
         )
 
@@ -1431,6 +1528,48 @@ def api_items_bulk():
             return jsonify({"error": f"Unknown action '{action}'."}), 400
 
         return jsonify({"ok": True, "count": len(targets)})
+
+
+@APP.route("/api/columns", methods=["POST"])
+def api_columns():
+    """Rename, delete, reorder, hide or relabel a column."""
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        action = (data.get("action") or "").strip()
+
+        if action == "rename":
+            old = (data.get("name") or "").strip()
+            new = (data.get("new_name") or "").strip()
+            if old in BASE_COLUMNS:
+                # built-in columns keep their field name; only the heading changes
+                s = read_col_settings()
+                if new and new != old:
+                    s["labels"][old] = new
+                else:
+                    s["labels"].pop(old, None)
+                write_col_settings(s)
+                log_history("relabel_column", old, f"heading -> {new or '(default)'}")
+                return jsonify({"ok": True, "relabelled": True})
+            ok, err = rename_custom_field(old, new)
+            return (jsonify({"ok": True}) if ok else (jsonify({"error": err}), 400))
+
+        if action == "delete":
+            ok, err = delete_custom_field((data.get("name") or "").strip())
+            return (jsonify({"ok": True}) if ok else (jsonify({"error": err}), 400))
+
+        if action in ("order", "hidden", "settings"):
+            s = read_col_settings()
+            if isinstance(data.get("order"), list):
+                s["order"] = [str(c) for c in data["order"]]
+            if isinstance(data.get("hidden"), list):
+                s["hidden"] = [str(c) for c in data["hidden"] if c != "name"]
+            if isinstance(data.get("labels"), dict):
+                s["labels"] = {str(k): str(v) for k, v in data["labels"].items() if v}
+            write_col_settings(s)
+            return jsonify({"ok": True, "columns": s})
+
+        return jsonify({"error": f"Unknown action '{action}'."}), 400
 
 
 @APP.route("/api/deleted")
@@ -2023,6 +2162,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .col-act{position:sticky;right:0;z-index:2;box-shadow:-1px 0 0 var(--line);text-align:right;}
   tbody td.col-name,tbody td.col-act{background:inherit;}
   th.col-name,th.col-act{background:var(--panel-2);z-index:3;}
+  .colhead{display:inline-flex;align-items:center;gap:5px;cursor:context-menu;}
+  .colmenu{opacity:0;color:var(--muted);cursor:pointer;padding:0 2px;border-radius:3px;}
+  th:hover .colmenu{opacity:1;}
+  .colmenu:hover{background:var(--line);color:var(--text);}
   .pickwrap{display:inline-flex;align-items:center;margin-right:9px;vertical-align:middle;}
   .rowpick,#selAll{cursor:pointer;margin:0;}
 
@@ -2138,6 +2281,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <span class="spacer" style="flex:1"></span>
         <label class="check"><input type="checkbox" id="includeSub" onchange="loadItems()"> include subcategories</label>
         <label class="check"><input type="checkbox" id="fillRows" onchange="toggleFillRows()"> fill whole row with colour</label>
+        <button class="btn small ghost" onclick="openColumnsModal()" title="Rename, reorder, hide or delete columns">Columns</button>
         <input class="search" id="search" placeholder="Search…" oninput="debouncedLoad()">
       </div>
       <div class="sel-bar" id="selBar" style="display:none">
@@ -2458,6 +2602,142 @@ async function renameSelected(){
   bulk({action:"rename",name:nn.trim()}, "Renamed");
 }
 
+// ---------- columns ----------
+let ALL_COLUMNS=[], CUSTOM_COLUMNS=[], LAST_COLS=[], COL_LABEL=(c=>c);
+
+function isCustomCol(c){ return CUSTOM_COLUMNS.includes(c); }
+
+async function saveColSettings(patch){
+  try{
+    await api("/api/columns",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({action:"settings", ...patch})});
+    await loadState();
+  }catch(e){ toast(e.error||"Failed","err"); }
+}
+
+// Save the order of every column currently on screen, with `col` shifted.
+async function moveColumn(col, dir){
+  const order=LAST_COLS.filter(c=>c!=="name");   // name is pinned, never moves
+  const i=order.indexOf(col);
+  const j=i+dir;
+  if(i<0||j<0||j>=order.length) return;
+  [order[i],order[j]]=[order[j],order[i]];
+  await saveColSettings({order:["name",...order]});
+  toast(`Moved "${COL_LABEL(col)}" ${dir<0?"left":"right"}`);
+}
+
+async function hideColumn(col){
+  const hidden=[...((STATE.columns||{}).hidden||[])];
+  if(!hidden.includes(col)) hidden.push(col);
+  await saveColSettings({hidden});
+  toast(`"${COL_LABEL(col)}" hidden`);
+}
+
+async function renameColumn(col){
+  const nn=await askText({
+    title:"Rename column",
+    message: isCustomCol(col)
+      ? "This renames the field for every item and in the CSV file."
+      : "This is a built-in column, so only its heading changes here.",
+    label:"Column heading", value:COL_LABEL(col), okLabel:"Rename"});
+  if(nn===null||!nn.trim()) return;
+  try{
+    await api("/api/columns",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({action:"rename",name:col,new_name:nn.trim()})});
+    toast("Column renamed"); await loadState();
+  }catch(e){ toast(e.error||"Failed","err"); }
+}
+
+async function deleteColumn(col){
+  if(!isCustomCol(col)){
+    toast("Built-in columns can't be deleted — hiding it instead","err");
+    return hideColumn(col);
+  }
+  const filled=(LAST_ITEMS||[]).filter(i=>String(i[col]||"").trim()).length;
+  const go=await askConfirm({
+    title:"Delete column",
+    message:`Delete the column <b>${esc(COL_LABEL(col))}</b>?<br><br>`
+           +`It currently holds data for <b>${filled}</b> item(s). That data is removed `
+           +`from every item and from the CSV file. This cannot be undone.`,
+    okLabel:"Delete column", cancelLabel:"Keep it", danger:true});
+  if(!go) return;
+  try{
+    await api("/api/columns",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({action:"delete",name:col})});
+    toast("Column deleted"); await loadState();
+  }catch(e){ toast(e.error||"Failed","err"); }
+}
+
+function openColMenu(x,y,col,cols){
+  closeRowMenu();
+  const order=cols.filter(c=>c!=="name");
+  const i=order.indexOf(col);
+  const entries=[
+    ["✏️ Rename…",       ()=>renameColumn(col),        true],
+    ["◀ Move left",      ()=>moveColumn(col,-1),       i>0],
+    ["▶ Move right",     ()=>moveColumn(col,+1),       i>=0 && i<order.length-1],
+    ["🚫 Hide column",   ()=>hideColumn(col),          col!=="name"],
+    ["🗑 Delete column…",()=>deleteColumn(col),        isCustomCol(col)],
+    ["⚙ All columns…",   ()=>openColumnsModal(),       true],
+  ].filter(e=>e[2]);
+
+  const menu=document.createElement("div");
+  menu.id="rowMenu"; menu.className="ctx-menu";
+  menu.innerHTML=`<div class="ctx-head">Column: ${esc(COL_LABEL(col))}`
+    + (isCustomCol(col)?"":" (built-in)") + `</div>`
+    + entries.map((e,k)=>`<button data-i="${k}">${esc(e[0])}</button>`).join("");
+  document.body.appendChild(menu);
+  const w=menu.offsetWidth,h=menu.offsetHeight;
+  menu.style.left=Math.max(6,Math.min(x,window.innerWidth-w-8))+"px";
+  menu.style.top =Math.max(6,Math.min(y,window.innerHeight-h-8))+"px";
+  menu.querySelectorAll("button").forEach(b=>b.onclick=()=>{
+    closeRowMenu(); entries[+b.dataset.i][1]();
+  });
+}
+
+async function openColumnsModal(){
+  const CS=STATE.columns||{labels:{},hidden:[],order:[]};
+  const hidden=CS.hidden||[];
+  const known=[...LAST_COLS, ...ALL_COLUMNS.filter(c=>!LAST_COLS.includes(c))]
+                .filter((c,i,a)=>a.indexOf(c)===i);
+  const body=`<p class="muted">Drag-free ordering: use the arrows. Unticking hides a column
+    from the table without touching the data.</p>
+    <div id="colList"></div>`;
+  const m=modalShell("Columns", body, `<button class="btn primary" onclick="closeModal()">Done</button>`);
+  m.style.maxWidth="560px"; showModal(m);
+
+  const draw=()=>{
+    m.querySelector("#colList").innerHTML = known.map((c,i)=>`
+      <div class="upd-row" style="grid-template-columns:26px 1fr auto;align-items:center">
+        <input type="checkbox" class="colvis" data-c="${esc(c)}" ${hidden.includes(c)?"":"checked"}
+               ${c==="name"?"disabled":""}>
+        <span>${esc(COL_LABEL(c))}${isCustomCol(c)?"":' <span class="muted">(built-in)</span>'}</span>
+        <span style="white-space:nowrap">
+          <button class="icon-btn" data-mv="-1" data-c="${esc(c)}" ${c==="name"?"disabled":""}>◀</button>
+          <button class="icon-btn" data-mv="1"  data-c="${esc(c)}" ${c==="name"?"disabled":""}>▶</button>
+          <button class="icon-btn" data-ren="${esc(c)}" title="Rename">✏️</button>
+          ${isCustomCol(c)?`<button class="icon-btn" data-del="${esc(c)}" title="Delete column">🗑</button>`:""}
+        </span></div>`).join("");
+    m.querySelectorAll(".colvis").forEach(cb=>cb.onchange=async()=>{
+      const c=cb.dataset.c;
+      const h=[...((STATE.columns||{}).hidden||[])].filter(x=>x!==c);
+      if(!cb.checked) h.push(c);
+      await saveColSettings({hidden:h});
+      closeModal(); openColumnsModal();
+    });
+    m.querySelectorAll("[data-mv]").forEach(b=>b.onclick=async()=>{
+      await moveColumn(b.dataset.c, +b.dataset.mv); closeModal(); openColumnsModal();
+    });
+    m.querySelectorAll("[data-ren]").forEach(b=>b.onclick=async()=>{
+      await renameColumn(b.dataset.ren); closeModal(); openColumnsModal();
+    });
+    m.querySelectorAll("[data-del]").forEach(b=>b.onclick=async()=>{
+      await deleteColumn(b.dataset.del); closeModal(); openColumnsModal();
+    });
+  };
+  draw();
+}
+
 // ---------- right-click menu ----------
 function closeRowMenu(){ const m=$("#rowMenu"); if(m) m.remove(); }
 function openRowMenu(x, y, it){
@@ -2516,18 +2796,32 @@ function renderTable(items, customFields){
   // columns that actually have data in this view
   const usedCustom = customFields.filter(f=>items.some(it=>(it[f]||"").trim()!==""));
   const anyUsed = items.some(it=>(it.status||"")==="used");
-  const cols=["name","quantity","category_path",...usedCustom,
-              ...(anyUsed?["status","used_note"]:[]),"date_added","last_modified"];
-  const labels={name:"Name",quantity:"Qty",category_path:"Category",date_added:"Added",
+  let cols=["name","quantity","category_path",...usedCustom,
+            ...(anyUsed?["status","used_note"]:[]),"date_added","last_modified"];
+
+  // column settings: saved order first, then anything new, minus hidden ones
+  const CS = (STATE.columns||{labels:{},hidden:[],order:[]});
+  const ord=CS.order||[], hidden=CS.hidden||[];
+  cols = [...ord.filter(c=>cols.includes(c)), ...cols.filter(c=>!ord.includes(c))];
+  cols = cols.filter(c=>c==="name" || !hidden.includes(c));
+  ALL_COLUMNS = [...new Set([...cols, ...usedCustom, "quantity","category_path",
+                             "status","used_note","date_added","last_modified"])];
+  CUSTOM_COLUMNS = customFields.slice();
+
+  const defaultLabels={name:"Name",quantity:"Qty",category_path:"Category",date_added:"Added",
                 last_modified:"Modified",status:"Status",used_note:"Used for"};
+  const labels=Object.assign({}, defaultLabels, CS.labels||{});
+  COL_LABEL = c => labels[c] || c;
   VISIBLE_IDS = items.map(it=>it.id);
   const dataCols = cols.filter(c=>c!=="name");     // name is pinned separately
 
   // the checkbox and the name share ONE pinned cell, so there is no seam for
   // horizontally scrolled content to show through
   let html="<table><thead><tr>"
-    + `<th class="col-name"><label class="pickwrap"><input type="checkbox" id="selAll" title="Select all"></label>Name</th>`;
-  dataCols.forEach(c=>html+=`<th>${esc(labels[c]||c)}</th>`);
+    + `<th class="col-name"><label class="pickwrap"><input type="checkbox" id="selAll" title="Select all"></label>`
+    + `<span class="colhead" data-col="name">${esc(labels["name"]||"Name")}</span></th>`;
+  dataCols.forEach(c=>html+=`<th data-col="${esc(c)}" title="Right-click to rename, move, hide or delete this column">`
+    + `<span class="colhead" data-col="${esc(c)}">${esc(labels[c]||c)}<span class="colmenu">⋯</span></span></th>`);
   html+=`<th class="col-act"></th></tr></thead><tbody>`;
 
   items.forEach(it=>{
@@ -2603,7 +2897,21 @@ function renderTable(items, customFields){
     renderTable(items, customFields);
   };
 
-  LAST_ITEMS=items; LAST_CUSTOM=customFields;
+  // column headers: right-click, or click the ⋯, to manage the column
+  wrap.querySelectorAll("th [data-col]").forEach(sp=>{
+    const col=sp.dataset.col;
+    sp.oncontextmenu=e=>{ e.preventDefault(); e.stopPropagation();
+                          openColMenu(e.clientX, e.clientY, col, cols); };
+    const dots=sp.querySelector(".colmenu");
+    if(dots) dots.onclick=e=>{ e.stopPropagation();
+      const r=dots.getBoundingClientRect(); openColMenu(r.left-120, r.bottom+4, col, cols); };
+  });
+  wrap.querySelectorAll("th").forEach(th=>{
+    if(th.dataset.col) th.oncontextmenu=e=>{ e.preventDefault();
+      openColMenu(e.clientX, e.clientY, th.dataset.col, cols); };
+  });
+
+  LAST_ITEMS=items; LAST_CUSTOM=customFields; LAST_COLS=cols;
   paintSelection();
 }
 

@@ -29,6 +29,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Change history** | Timestamped log of every add, edit, move and delete |
 | **Light & dark mode** | Toggle in the header, remembered across restarts |
 | **Custom background** | Choose the light-mode background from presets or any colour |
+| **Multi-select & right-click** | Select many rows and move, recolour, mark used or delete in one go |
 | **Choose your data folder** | Native folder picker; data is copied along when you switch |
 | **Readable CSV mirror** | One CSV per category, subcategories as labelled sections |
 | **Spreadsheet importer** | Feed it an `.xlsx` or `.csv` and it maps sheets → subcategories |
@@ -201,6 +202,16 @@ It figures out the messy parts for you:
 - **Keeps your colours** — a filled row (or a filled column, which fills a cell in every row) carries its colour onto the item. Excel *theme* colours are the one exception: the file stores them as a reference rather than an RGB value, so those come in without a colour. Direct and standard-palette fills work exactly.
 
 Always try `--dry-run` first on a file you care about — it prints the full mapping and writes nothing.
+
+---
+
+## Working with rows
+
+**Selecting.** Every row has a checkbox, and the header checkbox selects everything in view. **Shift-click** a row to select a range, **Ctrl/Cmd-click** to add or remove one. A bar appears above the table showing how many are selected, with actions that apply to all of them: **Rename** (one at a time), **Move to…**, **Colour…**, **Mark used**, **Back in stock** and **Delete**. **Esc** clears the selection.
+
+**Right-click** any row for the same actions as a context menu. Right-clicking inside a selection acts on the whole selection; right-clicking outside it selects that one row first. The **⋯** button on each row opens the same menu if you prefer clicking.
+
+**Nothing runs away from you.** The checkbox and item name are pinned to the left of the table and the action buttons are pinned to the right, so no matter how many custom columns you have or how far you scroll sideways, you can always see which row you are about to act on.
 
 ---
 

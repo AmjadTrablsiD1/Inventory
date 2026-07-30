@@ -68,7 +68,7 @@ LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -1352,6 +1352,87 @@ def api_item_status():
         return jsonify({"ok": True})
 
 
+@APP.route("/api/items/bulk", methods=["POST"])
+def api_items_bulk():
+    """Apply one action to several items at once: delete, move, colour, status."""
+    with LOCK:
+        ensure_files()
+        data = request.get_json(force=True)
+        ids = [str(i) for i in (data.get("ids") or [])]
+        action = (data.get("action") or "").strip()
+        if not ids:
+            return jsonify({"error": "Nothing selected."}), 400
+
+        rows, custom = read_inventory()
+        wanted = set(ids)
+        targets = [r for r in rows if r.get("id") in wanted]
+        if not targets:
+            return jsonify({"error": "None of those items exist any more."}), 404
+
+        ts = now_str()
+        names = ", ".join((t.get("name") or "?") for t in targets[:5])
+        if len(targets) > 5:
+            names += f" +{len(targets) - 5} more"
+
+        if action == "delete":
+            reason = (data.get("reason") or "").strip()
+            for t in targets:
+                archive_deleted(t, reason)
+            rows = [r for r in rows if r.get("id") not in wanted]
+            write_inventory(rows, custom)
+            log_history("delete_items", f"{len(targets)} item(s)",
+                        names + (f" - reason: {reason}" if reason else ""))
+
+        elif action == "move":
+            new_cat = (data.get("category_path") or "").strip()
+            for t in targets:
+                t["category_path"] = new_cat
+                t["last_modified"] = ts
+            write_inventory(rows, custom)
+            log_history("move_items", f"{len(targets)} item(s)",
+                        f"{names} -> '{new_cat or '(none)'}'")
+
+        elif action == "color":
+            color = (data.get("color") or "").strip()
+            for t in targets:
+                t["color"] = color
+                t["last_modified"] = ts
+            write_inventory(rows, custom)
+            log_history("colour_items", f"{len(targets)} item(s)",
+                        f"{names} -> {color or 'no colour'}")
+
+        elif action == "status":
+            status = (data.get("status") or "").strip().lower()
+            if status not in ("", "used"):
+                return jsonify({"error": "Unknown status."}), 400
+            note = (data.get("used_note") or "").strip()
+            for t in targets:
+                t["status"] = status
+                t["used_note"] = note if status == "used" else ""
+                t["used_date"] = ts if status == "used" else ""
+                t["last_modified"] = ts
+            write_inventory(rows, custom)
+            log_history("mark_used_items" if status else "return_to_stock_items",
+                        f"{len(targets)} item(s)", f"{names}. {note}".strip())
+
+        elif action == "rename":
+            new_name = (data.get("name") or "").strip()
+            if not new_name:
+                return jsonify({"error": "A name is required."}), 400
+            if len(targets) != 1:
+                return jsonify({"error": "Rename works on one item at a time."}), 400
+            old = targets[0].get("name", "")
+            targets[0]["name"] = new_name
+            targets[0]["last_modified"] = ts
+            write_inventory(rows, custom)
+            log_history("rename_item", targets[0].get("category_path", ""),
+                        f"'{old}' -> '{new_name}'")
+        else:
+            return jsonify({"error": f"Unknown action '{action}'."}), 400
+
+        return jsonify({"ok": True, "count": len(targets)})
+
+
 @APP.route("/api/deleted")
 def api_deleted():
     with LOCK:
@@ -1922,7 +2003,45 @@ INDEX_HTML = r"""<!DOCTYPE html>
   tbody tr{cursor:pointer;}
   tbody tr:hover{background:var(--panel-2);}
   .swatch{width:6px;height:30px;border-radius:3px;}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;
+       vertical-align:middle;box-shadow:0 0 0 1px var(--line) inset;}
   tbody tr.is-used td{opacity:.62;font-style:italic;}
+
+  /* rows carry their own background so the pinned columns can inherit it */
+  tbody tr{background:var(--bg);}
+  tbody tr:hover{background:var(--panel-2);}
+  tbody tr.is-picked{background:var(--accent-soft);}
+
+  /* pinned columns: the checkbox + name stay on the left, actions on the right,
+     so with many columns you always know which row you are acting on */
+  .col-name{position:sticky;left:0;z-index:2;font-weight:500;
+            box-shadow:1px 0 0 var(--line);max-width:none;}
+  .col-act{position:sticky;right:0;z-index:2;box-shadow:-1px 0 0 var(--line);text-align:right;}
+  tbody td.col-name,tbody td.col-act{background:inherit;}
+  th.col-name,th.col-act{background:var(--panel-2);z-index:3;}
+  .pickwrap{display:inline-flex;align-items:center;margin-right:9px;vertical-align:middle;}
+  .rowpick,#selAll{cursor:pointer;margin:0;}
+
+  .sel-bar{
+    display:flex;align-items:center;gap:8px;padding:8px 18px;
+    background:var(--accent-soft);border-bottom:1px solid var(--line);font-size:13px;
+  }
+
+  .ctx-menu{
+    position:fixed;z-index:200;min-width:196px;padding:5px;
+    background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    box-shadow:0 12px 34px rgba(0,0,0,.35);
+  }
+  .ctx-menu .ctx-head{
+    padding:6px 10px 8px;font-size:11px;color:var(--muted);
+    border-bottom:1px solid var(--line);margin-bottom:4px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:240px;
+  }
+  .ctx-menu button{
+    display:block;width:100%;text-align:left;background:none;border:none;
+    color:var(--text);padding:7px 10px;border-radius:6px;font-size:13px;
+  }
+  .ctx-menu button:hover{background:var(--panel-2);}
   .empty-state{padding:60px 20px;text-align:center;color:var(--muted);}
   .empty-state h3{color:var(--text);font-weight:600;margin:0 0 6px;}
 
@@ -2016,6 +2135,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <label class="check"><input type="checkbox" id="includeSub" onchange="loadItems()"> include subcategories</label>
         <label class="check"><input type="checkbox" id="fillRows" onchange="toggleFillRows()"> fill whole row with colour</label>
         <input class="search" id="search" placeholder="Search…" oninput="debouncedLoad()">
+      </div>
+      <div class="sel-bar" id="selBar" style="display:none">
+        <b id="selCount">0 selected</b>
+        <button class="btn small" id="selRename" onclick="renameSelected()">Rename…</button>
+        <button class="btn small" onclick="bulkMove()">Move to…</button>
+        <button class="btn small" onclick="bulkColor()">Colour…</button>
+        <button class="btn small" onclick="bulkUsed(false)">Mark used</button>
+        <button class="btn small" onclick="bulkUsed(true)">Back in stock</button>
+        <button class="btn small danger" onclick="bulkDelete()">Delete…</button>
+        <span style="flex:1"></span>
+        <button class="btn small ghost" onclick="clearSelection()">Clear</button>
       </div>
       <div class="table-wrap" id="tableWrap"></div>
     </section>
@@ -2209,6 +2339,143 @@ function toggleFillRows(){
   loadItems();
 }
 
+// ---------- selection ----------
+let SELECTED_IDS = new Set();
+let VISIBLE_IDS = [];
+let LAST_ITEMS = [], LAST_CUSTOM = [];
+let LAST_CLICKED = null;
+
+function toggleSelect(id, force){
+  const on = (force===undefined) ? !SELECTED_IDS.has(id) : force;
+  if(on) SELECTED_IDS.add(id); else SELECTED_IDS.delete(id);
+  LAST_CLICKED = id;
+  paintSelection();
+}
+function selectRange(id){
+  // shift-click selects everything between the last click and this row
+  const a=VISIBLE_IDS.indexOf(LAST_CLICKED), b=VISIBLE_IDS.indexOf(id);
+  if(a<0||b<0){ toggleSelect(id); return; }
+  const [lo,hi]=a<b?[a,b]:[b,a];
+  for(let i=lo;i<=hi;i++) SELECTED_IDS.add(VISIBLE_IDS[i]);
+  paintSelection();
+}
+function clearSelection(){ SELECTED_IDS.clear(); paintSelection(); }
+
+function paintSelection(){
+  document.querySelectorAll("#tableWrap tbody tr").forEach(tr=>{
+    const on=SELECTED_IDS.has(tr.dataset.id);
+    tr.classList.toggle("is-picked", on);
+    const cb=tr.querySelector(".rowpick"); if(cb) cb.checked=on;
+  });
+  const all=document.querySelector("#selAll");
+  if(all) all.checked = VISIBLE_IDS.length>0 && VISIBLE_IDS.every(id=>SELECTED_IDS.has(id));
+
+  const n=SELECTED_IDS.size, bar=$("#selBar");
+  if(!bar) return;
+  bar.style.display = n ? "flex" : "none";
+  if(n) $("#selCount").textContent = `${n} selected`;
+  const one=$("#selRename"); if(one) one.style.display = n===1 ? "" : "none";
+}
+
+function selectedIds(){ return [...SELECTED_IDS]; }
+
+async function bulk(payload, okMsg){
+  try{
+    const r=await api("/api/items/bulk",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({ids:selectedIds(), ...payload})});
+    toast(`${okMsg} (${r.count})`);
+    clearSelection(); loadState();
+  }catch(e){ toast(e.error||"Failed","err"); }
+}
+
+async function bulkMove(){
+  const opts=await categoryOptions("");
+  const body=`<p class="muted">${SELECTED_IDS.size} item(s) will be moved.</p>
+    <div class="field"><label>Move to category</label>
+      <select id="bulkCat"><option value="">— none —</option>${opts}</select></div>`;
+  const m=modalShell("Move items", body,
+    `<button class="btn ghost" onclick="closeModal()">Cancel</button>
+     <button class="btn primary" id="bulkGo">Move</button>`);
+  showModal(m);
+  m.querySelector("#bulkGo").onclick=()=>{
+    const cat=m.querySelector("#bulkCat").value; closeModal();
+    bulk({action:"move",category_path:cat}, "Moved");
+  };
+}
+async function bulkColor(){
+  const body=`<p class="muted">${SELECTED_IDS.size} item(s) will be recoloured.</p>
+    <div class="field"><label>Colour</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="color" id="bulkCol" value="#4c9be8" style="width:52px;height:34px;padding:2px">
+        <button class="btn small" id="bulkNoCol">No colour</button>
+      </div></div>`;
+  const m=modalShell("Set colour", body,
+    `<button class="btn ghost" onclick="closeModal()">Cancel</button>
+     <button class="btn primary" id="bulkGo">Apply</button>`);
+  showModal(m);
+  m.querySelector("#bulkNoCol").onclick=()=>{ closeModal(); bulk({action:"color",color:""}, "Colour cleared"); };
+  m.querySelector("#bulkGo").onclick=()=>{
+    const c=m.querySelector("#bulkCol").value; closeModal();
+    bulk({action:"color",color:c}, "Colour set");
+  };
+}
+async function bulkDelete(){
+  const n=SELECTED_IDS.size;
+  const reason=prompt(`Delete ${n} item(s)?\n\nThey are archived in deleted_items.csv.\nOptionally note why:`);
+  if(reason===null) return;
+  bulk({action:"delete",reason}, "Deleted and archived");
+}
+async function bulkUsed(back){
+  let note="";
+  if(!back){
+    note=prompt(`Mark ${SELECTED_IDS.size} item(s) as used.\n\nWhere are they used / who has them?`);
+    if(note===null) return;
+  }
+  bulk({action:"status",status:back?"":"used",used_note:note}, back?"Back in stock":"Marked as used");
+}
+async function renameSelected(){
+  const id=selectedIds()[0]; if(!id) return;
+  const it=(LAST_ITEMS||[]).find(x=>x.id===id);
+  const nn=prompt("Rename item:", it?it.name:"");
+  if(nn===null || !nn.trim()) return;
+  bulk({action:"rename",name:nn.trim()}, "Renamed");
+}
+
+// ---------- right-click menu ----------
+function closeRowMenu(){ const m=$("#rowMenu"); if(m) m.remove(); }
+function openRowMenu(x, y, it){
+  closeRowMenu();
+  const n=SELECTED_IDS.size;
+  const used=(it && (it.status||"")==="used");
+  const entries=[
+    ["✎ Edit…",            ()=>editItem(it.id),                 n===1],
+    ["✏️ Rename…",          ()=>renameSelected(),                n===1],
+    ["⇄ Move to category…", ()=>bulkMove(),                      true],
+    ["🎨 Set colour…",      ()=>bulkColor(),                     true],
+    [used?"↩ Return to stock":"✔ Mark as used",
+                            ()=>bulkUsed(used),                  true],
+    ["🛒 Add to order list", ()=>{ (LAST_ITEMS||[]).filter(i=>SELECTED_IDS.has(i.id))
+                                    .forEach(i=>addToOrder(i.name)); }, true],
+    ["🗑 Delete…",          ()=>bulkDelete(),                    true],
+  ].filter(e=>e[2]);
+
+  const menu=document.createElement("div");
+  menu.id="rowMenu"; menu.className="ctx-menu";
+  menu.innerHTML = `<div class="ctx-head">${n>1?`${n} items selected`:esc(it?it.name:"")}</div>`
+    + entries.map((e,i)=>`<button data-i="${i}">${esc(e[0])}</button>`).join("");
+  document.body.appendChild(menu);
+  const w=menu.offsetWidth, h=menu.offsetHeight;
+  menu.style.left = Math.max(6, Math.min(x, window.innerWidth  - w - 8)) + "px";
+  menu.style.top  = Math.max(6, Math.min(y, window.innerHeight - h - 8)) + "px";
+  menu.querySelectorAll("button").forEach(b=>b.onclick=()=>{
+    closeRowMenu(); entries[+b.dataset.i][1]();
+  });
+}
+document.addEventListener("click", e=>{ if(!e.target.closest("#rowMenu")) closeRowMenu(); });
+document.addEventListener("keydown", e=>{
+  if(e.key==="Escape"){ closeRowMenu(); if(!$("#overlay").classList.contains("show")) clearSelection(); }
+});
+
 // ---------- items ----------
 function debouncedLoad(){clearTimeout(SEARCH_TIMER);SEARCH_TIMER=setTimeout(loadItems,220);}
 
@@ -2236,32 +2503,91 @@ function renderTable(items, customFields){
               ...(anyUsed?["status","used_note"]:[]),"date_added","last_modified"];
   const labels={name:"Name",quantity:"Qty",category_path:"Category",date_added:"Added",
                 last_modified:"Modified",status:"Status",used_note:"Used for"};
-  let html="<table><thead><tr><th style='width:6px;padding:0'></th>";
-  cols.forEach(c=>html+=`<th>${esc(labels[c]||c)}</th>`);
-  html+="<th></th></tr></thead><tbody>";
+  VISIBLE_IDS = items.map(it=>it.id);
+  const dataCols = cols.filter(c=>c!=="name");     // name is pinned separately
+
+  // the checkbox and the name share ONE pinned cell, so there is no seam for
+  // horizontally scrolled content to show through
+  let html="<table><thead><tr>"
+    + `<th class="col-name"><label class="pickwrap"><input type="checkbox" id="selAll" title="Select all"></label>Name</th>`;
+  dataCols.forEach(c=>html+=`<th>${esc(labels[c]||c)}</th>`);
+  html+=`<th class="col-act"></th></tr></thead><tbody>`;
+
   items.forEach(it=>{
     const used=(it.status||"")==="used";
-    const swatch=it.color?`background:${esc(it.color)}`:"background:transparent";
-    // colour the whole row, or just the stripe at the start
+    // colour the whole row, or show it as a dot beside the name
     const rowStyle=(FILL_ROWS&&it.color)
       ? `background:${esc(it.color)};color:${readableOn(it.color)}`
       : "";
-    html+=`<tr class="${used?'is-used':''}" style="${rowStyle}" onclick='editItem(${JSON.stringify(it.id)})'>`;
-    html+=`<td style="padding:0"><div class="swatch" style="${swatch}"></div></td>`;
-    cols.forEach(c=>{
+    const picked=SELECTED_IDS.has(it.id);
+    const dot=it.color
+      ? `<span class="dot" style="background:${esc(it.color)}"></span>`
+      : `<span class="dot" style="background:transparent"></span>`;
+    html+=`<tr data-id="${esc(it.id)}" class="${used?'is-used ':''}${picked?'is-picked':''}" style="${rowStyle}">`;
+    html+=`<td class="col-name" title="${esc(it.name||"")}">`
+        + `<label class="pickwrap"><input type="checkbox" class="rowpick" data-id="${esc(it.id)}" ${picked?"checked":""}></label>`
+        + `${dot}${esc(it.name||"")}</td>`;
+    dataCols.forEach(c=>{
       let v=it[c]||"";
       if(c==="status") v = used?"Used":"In stock";
       html+=`<td title="${esc(v)}">${esc(v)}</td>`;
     });
-    html+=`<td style="white-space:nowrap">
-           <button class="icon-btn" title="Add to order list" onclick='event.stopPropagation();addToOrder(${JSON.stringify(it.name)})'>🛒</button>
-           <button class="icon-btn" title="${used?'Return to stock':'Mark as used'}" onclick='event.stopPropagation();toggleUsed(${JSON.stringify(it.id)},${used?"true":"false"})'>${used?"↩":"✔"}</button>
-           <button class="icon-btn" title="Move" onclick='event.stopPropagation();moveItem(${JSON.stringify(it.id)},${JSON.stringify(it.category_path)})'>⇄</button>
-           <button class="icon-btn" title="Delete" onclick='event.stopPropagation();deleteItem(${JSON.stringify(it.id)},${JSON.stringify(it.name)})'>🗑</button></td>`;
+    html+=`<td class="col-act" style="white-space:nowrap">
+           <button class="icon-btn" title="Add to order list" data-act="order" data-id="${esc(it.id)}">🛒</button>
+           <button class="icon-btn" title="${used?'Return to stock':'Mark as used'}" data-act="used" data-id="${esc(it.id)}">${used?"↩":"✔"}</button>
+           <button class="icon-btn" title="More… (or right-click the row)" data-act="menu" data-id="${esc(it.id)}">⋯</button></td>`;
     html+="</tr>";
   });
   html+="</tbody></table>";
   wrap.innerHTML=html;
+
+  // ---- wiring ----
+  const byId = id => items.find(x=>x.id===id);
+
+  wrap.querySelectorAll("tbody tr").forEach(tr=>{
+    const id=tr.dataset.id;
+    tr.onclick=e=>{
+      if(e.target.closest("button") || e.target.closest("input")) return;
+      if(e.shiftKey){ selectRange(id); return; }
+      if(e.metaKey||e.ctrlKey){ toggleSelect(id); return; }
+      editItem(id);
+    };
+    tr.oncontextmenu=e=>{
+      e.preventDefault();
+      if(!SELECTED_IDS.has(id)){ SELECTED_IDS.clear(); SELECTED_IDS.add(id); paintSelection(); }
+      openRowMenu(e.clientX, e.clientY, byId(id));
+    };
+  });
+
+  wrap.querySelectorAll(".rowpick").forEach(cb=>{
+    cb.onclick=e=>{ e.stopPropagation(); toggleSelect(cb.dataset.id, cb.checked); };
+  });
+
+  wrap.querySelectorAll("[data-act]").forEach(b=>{
+    b.onclick=e=>{
+      e.stopPropagation();
+      const it=byId(b.dataset.id);
+      if(b.dataset.act==="order") addToOrder(it.name);
+      else if(b.dataset.act==="used") toggleUsed(it.id,(it.status||"")==="used");
+      else {
+        const r=b.getBoundingClientRect();
+        if(!SELECTED_IDS.has(it.id)){ SELECTED_IDS.clear(); SELECTED_IDS.add(it.id); paintSelection(); }
+        openRowMenu(r.left-150, r.bottom+4, it);
+      }
+    };
+  });
+
+  const all=wrap.querySelector("#selAll");
+  all.checked = VISIBLE_IDS.length>0 && VISIBLE_IDS.every(id=>SELECTED_IDS.has(id));
+  all.onclick=e=>{
+    e.stopPropagation();
+    if(all.checked) VISIBLE_IDS.forEach(id=>SELECTED_IDS.add(id));
+    else VISIBLE_IDS.forEach(id=>SELECTED_IDS.delete(id));
+    renderTable(items, customFields);
+  };
+
+  LAST_ITEMS=items; LAST_CUSTOM=customFields;
+  paintSelection();
 }
 
 // ---------- modal infra ----------

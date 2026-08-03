@@ -68,7 +68,7 @@ LOCK = threading.RLock()  # single-user, but guards against overlapping requests
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -82,7 +82,12 @@ DEFAULT_DIR = os.environ.get(
     str(Path.home() / "InventoryData"),
 )
 
+# Per-user setting, private to one machine.
 CONFIG_FILE = Path.home() / ".inventory_manager_config.json"
+
+# Setting stored next to app.py. When the app sits on a shared drive this file
+# is shared too, so every computer running that copy finds the same data.
+PORTABLE_CONFIG_NAME = "inventory_config.json"
 
 INVENTORY_CSV = "inventory.csv"
 CATEGORIES_CSV = "categories.csv"
@@ -139,24 +144,124 @@ def env_data_dir():
     return (os.environ.get("INVENTORY_DIR") or "").strip()
 
 
+def portable_config_file():
+    return APP_DIR / PORTABLE_CONFIG_NAME
+
+
+def load_portable_config():
+    f = portable_config_file()
+    if f.exists():
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_portable_config(cfg):
+    try:
+        portable_config_file().write_text(
+            json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def portable_data_dir():
+    """
+    The data folder from the config beside app.py, if there is one.
+
+    A path *inside* the app's own folder is stored relative, so a shared drive
+    mounted as Z:\\ on one machine and /Volumes/share on another still resolves.
+    """
+    cfg = load_portable_config()
+    rel = cfg.get("data_dir_relative")
+    if rel:
+        try:
+            return (APP_DIR / rel).resolve()
+        except Exception:
+            return None
+    d = cfg.get("data_dir")
+    return Path(d).expanduser() if d else None
+
+
 def get_data_dir():
     """
-    Where the CSVs live. An explicitly set INVENTORY_DIR wins over the folder
-    saved from the UI - otherwise the variable would look like it does nothing
-    once a folder had ever been picked, which makes running a second instance
-    against a different folder impossible.
+    Where the CSVs live, in order of precedence:
+      1. INVENTORY_DIR                        - explicit, wins over everything
+      2. this machine's setting, if it was    - "just this computer" choice
+         saved with override_shared
+      3. the config next to app.py            - shared drive: same for everyone
+      4. this machine's setting
+      5. ~/InventoryData
     """
     env = env_data_dir()
     if env:
         return Path(env).expanduser()
+
     cfg = load_config()
+    if cfg.get("override_shared") and cfg.get("data_dir"):
+        return Path(cfg["data_dir"])
+
+    shared = portable_data_dir()
+    if shared:
+        return shared
+
     return Path(cfg.get("data_dir") or DEFAULT_DIR)
 
 
-def set_data_dir(path):
+def data_dir_source():
+    """Human-readable note about where the current setting comes from."""
+    if env_data_dir():
+        return {"scope": "env", "where": "INVENTORY_DIR environment variable"}
     cfg = load_config()
-    cfg["data_dir"] = str(path)
-    save_config(cfg)
+    if cfg.get("override_shared") and cfg.get("data_dir"):
+        return {"scope": "user", "where": str(CONFIG_FILE)}
+    if portable_data_dir():
+        return {"scope": "shared", "where": str(portable_config_file())}
+    if cfg.get("data_dir"):
+        return {"scope": "user", "where": str(CONFIG_FILE)}
+    return {"scope": "default", "where": "built-in default"}
+
+
+def set_data_dir(path, scope="shared"):
+    """
+    Remember the data folder. scope="shared" writes next to app.py so every
+    computer running this copy agrees; scope="user" keeps it to this machine.
+    Returns the scope actually used (shared falls back to user if app.py sits
+    somewhere unwritable).
+    """
+    path = Path(path)
+    if scope == "shared":
+        cfg = load_portable_config()
+        rel = None
+        try:
+            # Relative wherever it is sensible - including a sibling folder on
+            # the same share - so the setting survives the drive being mounted
+            # as Z:\ on one machine and /Volumes/share on another.
+            r = os.path.relpath(str(path.resolve()), str(APP_DIR.resolve()))
+            if not os.path.isabs(r) and r.count("..") <= 3:
+                rel = r
+        except Exception:
+            rel = None
+        if rel:
+            cfg.pop("data_dir", None)
+            cfg["data_dir_relative"] = rel
+        else:
+            cfg.pop("data_dir_relative", None)
+            cfg["data_dir"] = str(path)
+        if save_portable_config(cfg):
+            user = load_config()
+            user.pop("override_shared", None)   # stop overriding the shared one
+            user["data_dir"] = str(path)        # harmless fallback copy
+            save_config(user)
+            return "shared"
+
+    user = load_config()
+    user["data_dir"] = str(path)
+    user["override_shared"] = True
+    save_config(user)
+    return "user"
 
 
 def paths():
@@ -1308,6 +1413,8 @@ def api_state():
                 "version": APP_VERSION,
                 "dir_from_env": bool(env_data_dir()),
                 "columns": read_col_settings(),
+                "dir_source": data_dir_source(),
+                "app_dir": str(APP_DIR),
             }
         )
 
@@ -1978,6 +2085,7 @@ def api_set_dir():
         except Exception as e:
             return jsonify({"error": f"Could not use that folder: {e}"}), 400
 
+        scope = (data.get("scope") or "shared").strip()
         old_dir = get_data_dir()
         migrated = False
         # If we're switching to a fresh, empty folder but already have data,
@@ -1996,9 +2104,11 @@ def api_set_dir():
             except Exception:
                 migrated = False
 
-        set_data_dir(p)
+        used = set_data_dir(p, scope)
         ensure_files()
-        return jsonify({"ok": True, "data_dir": str(p), "migrated": migrated})
+        return jsonify({"ok": True, "data_dir": str(p), "migrated": migrated,
+                        "scope": used,
+                        "shared_failed": (scope == "shared" and used != "shared")})
 
 
 @APP.route("/")
@@ -3641,6 +3751,12 @@ function openDirModal(){
     </div></div>
     <p class="muted">Files stored here: inventory.csv, categories.csv, history.csv — all openable in Excel.
     Pick an empty folder and your current data is copied there automatically.</p>
+    <label class="check" style="margin:10px 0"><input type="checkbox" id="dirShared" checked>
+      remember this for <b>every computer</b> that runs this copy of the app</label>
+    <p class="muted">Ticked, the setting is saved in <code>inventory_config.json</code> next to app.py —
+    the right choice when the app lives on a shared drive, because every laptop then finds the same data.
+    Unticked, it applies only to this computer.</p>
+    <p class="muted">Currently taken from: ${esc((STATE.dir_source||{}).where||"—")}</p>
     ${STATE.dir_from_env?`<p class="muted" style="color:var(--accent)">Note: the folder is currently
     fixed by the INVENTORY_DIR environment variable, which overrides this setting for as long as it is set.</p>`:""}`;
   const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
@@ -3659,8 +3775,13 @@ function openDirModal(){
   }
   m.querySelector("#saveDir").onclick=async()=>{
     const path=m.querySelector("#dirInput").value.trim();
-    try{const r=await api("/api/set_dir",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path})});
-      toast(r.migrated?"Data folder set · existing data copied":"Data folder set"); closeModal(); loadState();
+    const scope=m.querySelector("#dirShared").checked?"shared":"user";
+    try{const r=await api("/api/set_dir",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({path,scope})});
+      let msg = r.migrated ? "Data folder set · existing data copied" : "Data folder set";
+      if(r.shared_failed) msg += " (couldn't write next to app.py — saved for this computer only)";
+      else if(r.scope==="shared") msg += " · shared with every computer";
+      toast(msg); closeModal(); loadState();
     }catch(e){toast(e.error||"Failed","err");}
   };
 }

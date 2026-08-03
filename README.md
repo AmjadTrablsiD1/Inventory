@@ -103,6 +103,24 @@ INVENTORY_DIR="/Volumes/share/inventory" python3 app.py
 
 If you pick a folder that has no inventory yet, your existing data is **copied there automatically** — the original folder is never deleted.
 
+### Running it from a shared drive
+
+Put the app folder on the share and let everyone run that same copy. When you set the data folder, leave **"remember this for every computer that runs this copy"** ticked: the setting is written to `inventory_config.json` **next to app.py**, so every laptop that opens the app finds the same data. Untick it to point one particular computer somewhere else.
+
+If the data folder sits inside or beside the app folder on the share, the setting is stored as a **relative** path — so it still works when the share is mounted as `Z:\` on one machine and `/Volumes/share` on another.
+
+Where the setting comes from, in order:
+
+1. `INVENTORY_DIR` environment variable
+2. this computer's own choice, if it was saved with the box unticked
+3. `inventory_config.json` next to `app.py` — the shared setting
+4. this computer's own choice
+5. `~/InventoryData`
+
+The **Data folder** dialog shows which of these is currently in effect.
+
+> One writer at a time. The app has no record locking, so two people saving at the same moment against the same shared folder can overwrite each other.
+
 ### File layout
 
 ```

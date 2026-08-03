@@ -27,6 +27,10 @@ env/
 Inventory Manager.app/
 *.app/
 
+# Portable data-folder setting (machine/share specific)
+inventory_config.json
+column_settings.json
+
 # Inventory data — never commit real inventory contents
 InventoryData/
 by_category/

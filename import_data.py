@@ -297,6 +297,7 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False,
             item["category_path"] = cat_path
             item["date_added"] = ts
             item["last_modified"] = ts
+            item["modified_by"] = inv.machine_identity()
             rows.append(item)
             count += 1
 

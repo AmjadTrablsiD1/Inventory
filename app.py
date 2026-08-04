@@ -24,10 +24,14 @@ import os
 import re
 import sys
 import json
+import time
 import uuid
 import shutil
+import getpass
+import socket
 import threading
 import subprocess
+import contextlib
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -64,11 +68,144 @@ except ModuleNotFoundError:
 # ----------------------------------------------------------------------------
 
 APP = Flask(__name__)
-LOCK = threading.RLock()  # single-user, but guards against overlapping requests
+
+LOCK_NAME = ".inventory.lock"
+LOCK_STALE_SECONDS = 45      # a lock older than this is assumed abandoned
+LOCK_WAIT_SECONDS = 12       # how long to queue behind someone else
+
+
+class SharedLock:
+    """
+    Guards a whole read-modify-write against other threads AND other computers
+    using the same data folder.
+
+    Without this, two people saving at once each read the file, each write it
+    back, and whoever finishes last silently erases the other's change. The
+    lock is a file created with O_EXCL in the data folder, so it works across
+    machines on a shared drive. A lock left behind by a crash or a yanked
+    network cable is taken over once it goes stale.
+    """
+
+    def __init__(self):
+        self._rlock = threading.RLock()
+        self._depth = 0
+        self._path = None
+        self.last_wait = 0.0
+        self.last_broke_stale = False
+
+    def _lock_path(self):
+        return get_data_dir() / LOCK_NAME
+
+    def _payload(self):
+        return json.dumps({"who": machine_identity(), "pid": os.getpid(),
+                           "host": _host_name(), "at": now_str()})
+
+    def _acquire_file(self):
+        path = self._lock_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self._path = None
+            return
+        started = time.time()
+        while True:
+            try:
+                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, self._payload().encode("utf-8"))
+                finally:
+                    os.close(fd)
+                self._path = path
+                self.last_wait = time.time() - started
+                return
+            except FileExistsError:
+                age = None
+                try:
+                    age = time.time() - path.stat().st_mtime
+                except Exception:
+                    pass
+                if age is not None and age > LOCK_STALE_SECONDS:
+                    try:                       # abandoned - take it over
+                        path.unlink()
+                        self.last_broke_stale = True
+                        continue
+                    except Exception:
+                        pass
+                if time.time() - started > LOCK_WAIT_SECONDS:
+                    # Never hang the app: a normal save takes milliseconds, so
+                    # something is wrong. Take the lock and carry on.
+                    try:
+                        path.unlink()
+                        self.last_broke_stale = True
+                        continue
+                    except Exception:
+                        self._path = None
+                        self.last_wait = time.time() - started
+                        return
+                time.sleep(0.12)
+            except Exception:
+                self._path = None      # read-only folder etc: carry on unlocked
+                return
+
+    def _release_file(self):
+        if self._path:
+            try:
+                self._path.unlink()
+            except Exception:
+                pass
+        self._path = None
+
+    def __enter__(self):
+        self._rlock.acquire()
+        self._depth += 1
+        if self._depth == 1:
+            self._acquire_file()
+        return self
+
+    def __exit__(self, *exc):
+        self._depth -= 1
+        if self._depth == 0:
+            self._release_file()
+        self._rlock.release()
+        return False
+
+
+LOCK = SharedLock()
+
+
+@contextlib.contextmanager
+def atomic_write(path, encoding="utf-8-sig", newline=""):
+    """
+    Write a file in full or not at all: build it beside the target, then swap
+    it in with one rename. A crash or a dropped network share can no longer
+    leave a half-written inventory behind.
+    """
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    f = tmp.open("w", encoding=encoding, newline=newline)
+    try:
+        yield f
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+        f.close()
+        os.replace(str(tmp), str(path))
+    except Exception:
+        try:
+            f.close()
+        except Exception:
+            pass
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        raise
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -112,7 +249,7 @@ UNCATEGORIZED = "_Uncategorized"
 #   used_date  - when it was marked used
 BASE_COLUMNS = ["id", "category_path", "name", "quantity",
                 "color", "status", "used_note", "used_date",
-                "date_added", "last_modified"]
+                "date_added", "last_modified", "modified_by"]
 
 # Columns that exist for the program's benefit rather than the user's.
 # A "clean" export leaves these out.
@@ -142,6 +279,48 @@ def save_config(cfg):
 def env_data_dir():
     """The data folder pinned by INVENTORY_DIR, if that variable is set."""
     return (os.environ.get("INVENTORY_DIR") or "").strip()
+
+
+def _host_name():
+    try:
+        return socket.gethostname().split(".")[0]
+    except Exception:
+        return "pc"
+
+
+def machine_identity():
+    """
+    Who to credit for a change.
+
+    Each person runs their own copy of the app against the shared folder, so
+    the server always sees 127.0.0.1 - an IP address cannot tell people apart.
+    The computer/user name can, and it can be replaced with a friendly one.
+    """
+    name = (os.environ.get("INVENTORY_USER") or "").strip()
+    if name:
+        return name
+    try:
+        name = (load_config().get("user_name") or "").strip()
+    except Exception:
+        name = ""
+    if name:
+        return name
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "user"
+    return f"{user}@{_host_name()}"
+
+
+def set_machine_identity(name):
+    cfg = load_config()
+    name = (name or "").strip()
+    if name:
+        cfg["user_name"] = name
+    else:
+        cfg.pop("user_name", None)
+    save_config(cfg)
+    return machine_identity()
 
 
 def portable_config_file():
@@ -517,9 +696,11 @@ def ensure_files():
             w = csv.writer(f)
             w.writerow(["category_path", "required_fields"])
     if not hist.exists():
-        with hist.open("w", newline="", encoding="utf-8-sig") as f:
+        with atomic_write(hist) as f:
             w = csv.writer(f)
-            w.writerow(["timestamp", "action", "target", "detail"])
+            w.writerow(HISTORY_COLUMNS)
+    else:
+        migrate_history(hist)
 
 
 def read_inventory():
@@ -543,7 +724,7 @@ def write_inventory(rows, custom_fields, sync_view=True):
     """Write all item rows. custom_fields is the union of extra columns."""
     _, inv, _, _ = paths()
     header = list(BASE_COLUMNS) + list(custom_fields)
-    with inv.open("w", newline="", encoding="utf-8-sig") as f:
+    with atomic_write(inv) as f:
         w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
         w.writeheader()
         for r in rows:
@@ -572,7 +753,7 @@ def read_categories():
 
 def write_categories(cat_map, sync_view=True):
     _, _, cats, _ = paths()
-    with cats.open("w", newline="", encoding="utf-8-sig") as f:
+    with atomic_write(cats) as f:
         w = csv.writer(f)
         w.writerow(["category_path", "required_fields"])
         for path in sorted(cat_map.keys()):
@@ -581,11 +762,36 @@ def write_categories(cat_map, sync_view=True):
         write_hierarchy()
 
 
-def log_history(action, target, detail=""):
-    _, _, _, hist = paths()
-    with hist.open("a", newline="", encoding="utf-8-sig") as f:
+HISTORY_COLUMNS = ["timestamp", "who", "action", "target", "detail"]
+
+
+def migrate_history(hist):
+    """Add the 'who' column to a history file written by an older version."""
+    try:
+        with hist.open("r", newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+    except Exception:
+        return
+    if not rows or rows[0] == HISTORY_COLUMNS:
+        return
+    if rows[0][:1] != ["timestamp"]:
+        return                                  # not ours - leave it alone
+    with atomic_write(hist) as f:
         w = csv.writer(f)
-        w.writerow([now_str(), action, target, detail])
+        w.writerow(HISTORY_COLUMNS)
+        for r in rows[1:]:
+            if len(r) >= 4:                     # timestamp, action, target, detail
+                w.writerow([r[0], "", r[1], r[2], r[3]])
+
+
+def log_history(action, target, detail="", who=None):
+    _, _, _, hist = paths()
+    try:
+        with hist.open("a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([now_str(), who or machine_identity(), action, target, detail])
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -834,7 +1040,7 @@ def write_order(rows):
         if not item:
             continue
         clean.append({c: str(r.get(c) or "").strip() for c in ORDER_COLUMNS})
-    with f.open("w", newline="", encoding="utf-8-sig") as fh:
+    with atomic_write(f) as fh:
         w = csv.DictWriter(fh, fieldnames=ORDER_COLUMNS, extrasaction="ignore")
         w.writeheader()
         w.writerows(clean)
@@ -1192,6 +1398,13 @@ def inherited_required_fields(category_path):
     return fields
 
 
+def touch(row, ts=None):
+    """Stamp an item with when it changed and who changed it."""
+    row["last_modified"] = ts or now_str()
+    row["modified_by"] = machine_identity()
+    return row
+
+
 def sanitize_field_name(name):
     name = name.strip()
     # keep it Excel-friendly and safe as a CSV column header
@@ -1415,6 +1628,8 @@ def api_state():
                 "columns": read_col_settings(),
                 "dir_source": data_dir_source(),
                 "app_dir": str(APP_DIR),
+                "me": machine_identity(),
+                "data_version": data_version(),
             }
         )
 
@@ -1482,7 +1697,7 @@ def api_item_save():
             old = dict(found)
             for k, v in fields.items():
                 found[k] = v
-            found["last_modified"] = ts
+            touch(found, ts)
             changed = [
                 k for k in fields
                 if str(old.get(k, "")) != str(fields.get(k, ""))
@@ -1495,7 +1710,7 @@ def api_item_save():
             row.update(fields)
             row["id"] = new_id
             row["date_added"] = ts
-            row["last_modified"] = ts
+            touch(row, ts)
             rows.append(row)
             log_history("add_item", f"{category}/{name}", f"id={new_id}")
 
@@ -1547,7 +1762,7 @@ def api_item_status():
         target["status"] = status
         target["used_note"] = note if status == "used" else ""
         target["used_date"] = now_str() if status == "used" else ""
-        target["last_modified"] = now_str()
+        touch(target)
         write_inventory(rows, custom)
         log_history(
             "mark_used" if status == "used" else "return_to_stock",
@@ -1591,7 +1806,7 @@ def api_items_bulk():
             new_cat = (data.get("category_path") or "").strip()
             for t in targets:
                 t["category_path"] = new_cat
-                t["last_modified"] = ts
+                touch(t, ts)
             write_inventory(rows, custom)
             log_history("move_items", f"{len(targets)} item(s)",
                         f"{names} -> '{new_cat or '(none)'}'")
@@ -1600,7 +1815,7 @@ def api_items_bulk():
             color = (data.get("color") or "").strip()
             for t in targets:
                 t["color"] = color
-                t["last_modified"] = ts
+                touch(t, ts)
             write_inventory(rows, custom)
             log_history("colour_items", f"{len(targets)} item(s)",
                         f"{names} -> {color or 'no colour'}")
@@ -1614,7 +1829,7 @@ def api_items_bulk():
                 t["status"] = status
                 t["used_note"] = note if status == "used" else ""
                 t["used_date"] = ts if status == "used" else ""
-                t["last_modified"] = ts
+                touch(t, ts)
             write_inventory(rows, custom)
             log_history("mark_used_items" if status else "return_to_stock_items",
                         f"{len(targets)} item(s)", f"{names}. {note}".strip())
@@ -1627,7 +1842,7 @@ def api_items_bulk():
                 return jsonify({"error": "Rename works on one item at a time."}), 400
             old = targets[0].get("name", "")
             targets[0]["name"] = new_name
-            targets[0]["last_modified"] = ts
+            touch(targets[0], ts)
             write_inventory(rows, custom)
             log_history("rename_item", targets[0].get("category_path", ""),
                         f"'{old}' -> '{new_name}'")
@@ -1635,6 +1850,40 @@ def api_items_bulk():
             return jsonify({"error": f"Unknown action '{action}'."}), 400
 
         return jsonify({"ok": True, "count": len(targets)})
+
+
+def data_version():
+    """A cheap fingerprint of the inventory file, to spot other people's saves."""
+    try:
+        st = (get_data_dir() / INVENTORY_CSV).stat()
+        return f"{st.st_mtime_ns}-{st.st_size}"
+    except Exception:
+        return "0"
+
+
+@APP.route("/api/ping")
+def api_ping():
+    """Polled by the browser to notice changes made on another computer."""
+    last = {}
+    try:
+        rows = read_history(1)
+        if rows:
+            last = {"who": rows[0].get("who", ""), "action": rows[0].get("action", ""),
+                    "target": rows[0].get("target", ""), "at": rows[0].get("timestamp", "")}
+    except Exception:
+        pass
+    return jsonify({"version": data_version(), "last": last, "me": machine_identity()})
+
+
+@APP.route("/api/identity", methods=["GET", "POST"])
+def api_identity():
+    if request.method == "POST":
+        data = request.get_json(force=True)
+        name = set_machine_identity(data.get("name"))
+        log_history("set_name", name, "this computer identifies itself as this")
+        return jsonify({"ok": True, "name": name})
+    return jsonify({"name": machine_identity(),
+                    "from_env": bool(os.environ.get("INVENTORY_USER"))})
 
 
 @APP.route("/api/columns", methods=["POST"])
@@ -1823,7 +2072,7 @@ def api_item_move():
             return jsonify({"error": "Item not found."}), 404
         old_cat = target.get("category_path", "")
         target["category_path"] = new_cat
-        target["last_modified"] = now_str()
+        touch(target)
         write_inventory(rows, custom)
         log_history("move_item", f"{new_cat}/{target.get('name','')}",
                     f"from '{old_cat}' to '{new_cat}'")
@@ -1884,7 +2133,7 @@ def api_category_rename():
             p = r.get("category_path", "")
             if p == old_path or p.startswith(old_path + "/"):
                 r["category_path"] = new_path + p[len(old_path):]
-                r["last_modified"] = now_str()
+                touch(r)
         write_inventory(rows, custom)
         log_history("rename_category", old_path, f"-> {new_path}")
         return jsonify({"ok": True, "new_path": new_path})
@@ -2279,6 +2528,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .pickwrap{display:inline-flex;align-items:center;margin-right:9px;vertical-align:middle;}
   .rowpick,#selAll{cursor:pointer;margin:0;}
 
+  .refresh-bar{
+    display:flex;align-items:center;gap:10px;padding:8px 18px;font-size:13px;
+    background:var(--accent-soft);border-bottom:1px solid var(--accent);
+  }
   .sel-bar{
     display:flex;align-items:center;gap:8px;padding:8px 18px;
     background:var(--accent-soft);border-bottom:1px solid var(--line);font-size:13px;
@@ -3724,13 +3977,58 @@ function openImportModal(){
   };
 }
 
+// ---------- who am I / other people's changes ----------
+async function changeIdentity(){
+  const cur=STATE.me||"";
+  const nn=await askText({title:"Your name on this computer",
+    message:"Shown against every change you make, so a shared inventory says who did what.",
+    label:"Name", value:cur, placeholder:"e.g. Amjad (Lab laptop)", okLabel:"Save"});
+  if(nn===null) return;
+  try{
+    const r=await api("/api/identity",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name:nn.trim()})});
+    toast(`You are now "${r.name}"`); await loadState();
+  }catch(e){ toast(e.error||"Failed","err"); }
+}
+
+let DATA_VERSION=null, RELOAD_HINT=false;
+async function checkForOthers(){
+  if($("#overlay").classList.contains("show")) return;   // don't nag mid-edit
+  try{
+    const r=await api("/api/ping");
+    if(DATA_VERSION===null){ DATA_VERSION=r.version; return; }
+    if(r.version!==DATA_VERSION){
+      DATA_VERSION=r.version;
+      const who=(r.last&&r.last.who && r.last.who!==r.me) ? r.last.who : null;
+      if(who && !RELOAD_HINT){
+        RELOAD_HINT=true;
+        showRefreshBar(`${who} changed the inventory (${(r.last.action||"").replace(/_/g," ")})`);
+      }else{
+        loadState();                    // our own change, or unattributed
+      }
+    }
+  }catch(e){ /* offline / share unavailable - stay quiet */ }
+}
+function showRefreshBar(msg){
+  let b=$("#refreshBar");
+  if(!b){
+    b=document.createElement("div"); b.id="refreshBar"; b.className="refresh-bar";
+    document.querySelector(".content").insertBefore(b, document.querySelector(".table-wrap"));
+  }
+  b.innerHTML=`<span>${esc(msg)}</span>
+    <button class="btn small primary" onclick="RELOAD_HINT=false;this.parentElement.remove();loadState()">Refresh</button>`;
+  b.style.display="flex";
+}
+
 // ---------- history ----------
 async function openHistory(){
   const data=await api("/api/history");
   const rows=data.history||[];
   const body = rows.length
-    ? `<div>${rows.map(h=>`<div class="hist-item">
-        <span class="ts">${esc(h.timestamp)}</span>
+    ? `<p class="muted">You are <b>${esc(STATE.me||"")}</b> —
+       <a href="#" onclick="event.preventDefault();changeIdentity()">change name</a></p>
+       <div style="margin-top:10px">${rows.map(h=>`<div class="hist-item">
+        <span class="ts">${esc(h.timestamp)}<br><b>${esc(h.who||"—")}</b></span>
         <span class="act">${esc(h.action)}</span>
         <span>${esc(h.target)}${h.detail?` — <span class="muted">${esc(h.detail)}</span>`:""}</span></div>`).join("")}</div>`
     : `<p class="muted">No changes recorded yet.</p>`;
@@ -3789,6 +4087,7 @@ function openDirModal(){
 $("#fillRows").checked = FILL_ROWS;     // restore the colour-display preference
 loadState();
 setTimeout(checkUpdateQuietly, 1500);   // background check, silent if offline
+setInterval(checkForOthers, 7000);      // notice saves made on another computer
 </script>
 </body>
 </html>

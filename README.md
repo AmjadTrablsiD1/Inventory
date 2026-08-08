@@ -268,6 +268,10 @@ Imported spreadsheets often arrive with unhelpful headings like `333`, or column
 
 The **Columns** dialog lists everything at once with tick boxes for visibility and arrows for order. Settings live in `column_settings.json` next to your data, so they travel with the folder rather than being stuck in one browser.
 
+**Column widths.** Drag the right-hand edge of any heading to resize it. Widths are remembered with the rest of the column settings; **Reset width** (or **Reset all widths**) in the heading's right-click menu puts them back.
+
+The name column has a fixed default width, so one very long item name can no longer stretch it across the window and push the other columns out of sight. Turn on **wrap long text** in the toolbar to read the whole name over several lines within that width.
+
 > The *Name* column can't be hidden or moved — it stays pinned to the left as your anchor for every row.
 
 ---

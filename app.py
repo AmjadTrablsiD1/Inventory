@@ -205,7 +205,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.1"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -468,7 +468,7 @@ def order_path():
 
 def read_col_settings():
     f = get_data_dir() / COLUMNS_JSON
-    out = {"labels": {}, "hidden": [], "order": []}
+    out = {"labels": {}, "hidden": [], "order": [], "widths": {}}
     if f.exists():
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
@@ -1953,6 +1953,10 @@ def api_columns():
                 s["hidden"] = [str(c) for c in data["hidden"] if c != "name"]
             if isinstance(data.get("labels"), dict):
                 s["labels"] = {str(k): str(v) for k, v in data["labels"].items() if v}
+            if isinstance(data.get("widths"), dict):
+                s["widths"] = {str(k): max(60, min(620, int(v)))
+                               for k, v in data["widths"].items()
+                               if str(v).lstrip("-").isdigit() or isinstance(v, int)}
             write_col_settings(s)
             return jsonify({"ok": True, "columns": s})
 
@@ -2545,7 +2549,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   /* show the full text of long values instead of clipping them to one line */
   table.wrap td{white-space:normal;overflow:visible;text-overflow:clip;
                 word-break:break-word;vertical-align:top;}
-  table.wrap td.col-name{min-width:220px;max-width:380px;}
+  /* wrapping lets the browser shrink the column to a tall narrow strip,
+     so give it a floor as well as a ceiling */
+  table.wrap td{min-width:80px;}
   th{
     position:sticky;top:0;background:var(--panel-2);color:var(--muted);
     font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;z-index:1;
@@ -2564,11 +2570,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   /* pinned columns: the checkbox + name stay on the left, actions on the right,
      so with many columns you always know which row you are acting on */
+  /* the pinned name column must stay bounded: with no cap a single long name
+     stretched it across the whole window and pushed every other column away */
   .col-name{position:sticky;left:0;z-index:2;font-weight:500;
-            box-shadow:1px 0 0 var(--line);max-width:none;}
+            box-shadow:1px 0 0 var(--line);max-width:300px;}
+  /* the real cap lives here: a <td> max-width is only a suggestion to the
+     auto table layout, so a long name still stretched the pinned column and
+     pushed every other column out of sight */
+  .nmwrap{display:flex;align-items:flex-start;}
+  .nm{max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  table.wrap .nm{white-space:normal;word-break:break-word;}
   .col-act{position:sticky;right:0;z-index:2;box-shadow:-1px 0 0 var(--line);text-align:right;}
   tbody td.col-name,tbody td.col-act{background:inherit;}
   th.col-name,th.col-act{background:var(--panel-2);z-index:3;}
+  th{position:relative;}
+  .col-resize{
+    position:absolute;top:0;right:0;width:7px;height:100%;cursor:col-resize;
+    user-select:none;
+  }
+  .col-resize:hover,.col-resize.dragging{background:var(--accent);opacity:.7;}
   .colhead{display:inline-flex;align-items:center;gap:5px;cursor:context-menu;}
   .colmenu{opacity:0;color:var(--muted);cursor:pointer;padding:0 2px;border-radius:3px;}
   th:hover .colmenu{opacity:1;}
@@ -3049,6 +3069,13 @@ async function moveColumn(col, dir){
   toast(`Moved "${COL_LABEL(col)}" ${dir<0?"left":"right"}`);
 }
 
+async function resetColWidth(col){
+  const widths={...((STATE.columns||{}).widths||{})};
+  delete widths[col];
+  await saveColSettings({widths});
+  toast(`"${COL_LABEL(col)}" back to its default width`);
+}
+
 async function unhideAll(){
   await saveColSettings({hidden:[]});
   toast("All hidden columns are showing again");
@@ -3104,8 +3131,11 @@ function openColMenu(x,y,col,cols){
     ["✏️ Rename…",       ()=>renameColumn(col),        true],
     ["◀ Move left",      ()=>moveColumn(col,-1),       i>0],
     ["▶ Move right",     ()=>moveColumn(col,+1),       i>=0 && i<order.length-1],
+    ["↔ Reset width",    ()=>resetColWidth(col),       !!((STATE.columns||{}).widths||{})[col]],
     ["🚫 Hide column",   ()=>hideColumn(col),          col!=="name"],
     ["🗑 Delete column…",()=>deleteColumn(col),        isCustomCol(col)],
+    ["↩ Reset all widths",()=>saveColSettings({widths:{}}).then(()=>toast("Column widths reset")),
+                            Object.keys((STATE.columns||{}).widths||{}).length>0],
     ["⚙ All columns…",   ()=>openColumnsModal(),       true],
   ].filter(e=>e[2]);
 
@@ -3240,6 +3270,16 @@ function renderTable(items, customFields){
                              "status","used_note","date_added","last_modified"])];
   CUSTOM_COLUMNS = customFields.slice();
 
+  const WIDTHS = CS.widths||{};
+  const COL_MIN=60, COL_MAX=620;
+  // an explicit width is respected by the auto table layout; max-width alone is
+  // only advisory, which is how one long name took over the whole table
+  const wpx = c => {
+    const v = WIDTHS[c] || (c === "name" ? 260 : 0);
+    return v ? Math.min(COL_MAX, Math.max(COL_MIN, +v)) : 0;
+  };
+  const wstyle = c => wpx(c)
+      ? `width:${wpx(c)}px;min-width:${wpx(c)}px;max-width:${wpx(c)}px;` : "";
   const defaultLabels={name:"Name",quantity:"Qty",category_path:"Category",date_added:"Added",
                 last_modified:"Modified",status:"Status",used_note:"Used for"};
   const labels=Object.assign({}, defaultLabels, CS.labels||{});
@@ -3250,10 +3290,12 @@ function renderTable(items, customFields){
   // the checkbox and the name share ONE pinned cell, so there is no seam for
   // horizontally scrolled content to show through
   let html="<table><thead><tr>"
-    + `<th class="col-name"><label class="pickwrap"><input type="checkbox" id="selAll" title="Select all"></label>`
-    + `<span class="colhead" data-col="name">${esc(labels["name"]||"Name")}</span></th>`;
-  dataCols.forEach(c=>html+=`<th data-col="${esc(c)}" title="Right-click to rename, move, hide or delete this column">`
-    + `<span class="colhead" data-col="${esc(c)}">${esc(labels[c]||c)}<span class="colmenu">⋯</span></span></th>`);
+    + `<th class="col-name" style="${wstyle("name")}"><label class="pickwrap"><input type="checkbox" id="selAll" title="Select all"></label>`
+    + `<span class="colhead" data-col="name">${esc(labels["name"]||"Name")}</span>`
+    + `<span class="col-resize" data-rz="name" title="Drag to resize"></span></th>`;
+  dataCols.forEach(c=>html+=`<th data-col="${esc(c)}" style="${wstyle(c)}" title="Right-click to rename, move, hide or delete this column">`
+    + `<span class="colhead" data-col="${esc(c)}">${esc(labels[c]||c)}<span class="colmenu">⋯</span></span>`
+    + `<span class="col-resize" data-rz="${esc(c)}" title="Drag to resize"></span></th>`);
   html+=`<th class="col-act"></th></tr></thead><tbody>`;
 
   items.forEach(it=>{
@@ -3267,13 +3309,14 @@ function renderTable(items, customFields){
       ? `<span class="dot" style="background:${esc(it.color)}"></span>`
       : `<span class="dot" style="background:transparent"></span>`;
     html+=`<tr data-id="${esc(it.id)}" class="${used?'is-used ':''}${picked?'is-picked':''}" style="${rowStyle}">`;
-    html+=`<td class="col-name" title="${esc(it.name||"")}">`
+    html+=`<td class="col-name" style="${wstyle("name")}" title="${esc(it.name||"")}">`
+        + `<div class="nmwrap">`
         + `<label class="pickwrap"><input type="checkbox" class="rowpick" data-id="${esc(it.id)}" ${picked?"checked":""}></label>`
-        + `${dot}${esc(it.name||"")}</td>`;
+        + `${dot}<span class="nm">${esc(it.name||"")}</span></div></td>`;
     dataCols.forEach(c=>{
       let v=it[c]||"";
       if(c==="status") v = used?"Used":"In stock";
-      html+=`<td title="${esc(v)}">${esc(v)}</td>`;
+      html+=`<td style="${wstyle(c)}" title="${esc(v)}">${esc(v)}</td>`;
     });
     html+=`<td class="col-act" style="white-space:nowrap">
            <button class="icon-btn" title="Add to order list" data-act="order" data-id="${esc(it.id)}">🛒</button>
@@ -3348,6 +3391,39 @@ function renderTable(items, customFields){
   wrap.querySelectorAll("th").forEach(th=>{
     if(th.dataset.col) th.oncontextmenu=e=>{ e.preventDefault();
       openColMenu(e.clientX, e.clientY, th.dataset.col, cols); };
+  });
+
+  wrap.querySelectorAll(".col-resize").forEach(rz=>{
+    rz.onmousedown=e=>{
+      if(e.button!==0) return;              // left button only
+      e.preventDefault(); e.stopPropagation();
+      const col=rz.dataset.rz;
+      const th=rz.closest("th");
+      const startX=e.clientX, startW=th.getBoundingClientRect().width;
+      const idx=[...th.parentElement.children].indexOf(th);
+      rz.classList.add("dragging");
+      const cells=[th, ...wrap.querySelectorAll(`tbody tr > *:nth-child(${idx+1})`)];
+      let moved=false;
+      const onMove=ev=>{
+        if(Math.abs(ev.clientX-startX)<5) return;   // ignore a click or a nudge
+        moved=true;
+        const w=Math.min(620, Math.max(60, Math.round(startW + ev.clientX - startX)));
+        cells.forEach(el=>{ el.style.width=w+"px"; el.style.minWidth=w+"px"; el.style.maxWidth=w+"px"; });
+        rz.dataset.w=w;
+      };
+      const onUp=async()=>{
+        document.removeEventListener("mousemove",onMove);
+        document.removeEventListener("mouseup",onUp);
+        rz.classList.remove("dragging");
+        if(moved && rz.dataset.w){
+          const widths={...((STATE.columns||{}).widths||{})};
+          widths[col]=+rz.dataset.w;
+          await saveColSettings({widths});
+        }
+      };
+      document.addEventListener("mousemove",onMove);
+      document.addEventListener("mouseup",onUp);
+    };
   });
 
   LAST_ITEMS=items; LAST_CUSTOM=customFields; LAST_COLS=cols;

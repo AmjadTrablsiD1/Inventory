@@ -58,6 +58,32 @@ def _clean(v):
     return "" if s.lower() in ("nan", "null") else s
 
 
+def sniff_delimiter(sample):
+    """
+    Work out the separator. csv.Sniffer is easily fooled by a file whose first
+    line contains commas inside quotes, and answering "comma" for a semicolon
+    file collapses every row into a single column - so its verdict is checked
+    by counting how consistently each candidate splits the first few lines.
+    """
+    lines = [l for l in sample.splitlines() if l.strip()][:10]
+    best, best_score = ",", -1
+    for d in [",", ";", "\t", "|"]:
+        counts = [len(next(csv.reader([l], delimiter=d))) for l in lines] or [1]
+        fields = max(counts)
+        if fields < 2:
+            continue
+        consistent = sum(1 for c in counts if c == counts[0])
+        score = fields * 10 + consistent          # prefer more, steadier columns
+        if score > best_score:
+            best, best_score = d, score
+    if best_score < 0:
+        try:
+            return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+        except Exception:
+            return ","
+    return best
+
+
 def read_csv_sheets(path):
     """A CSV is one sheet; its name is the file stem."""
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
@@ -65,20 +91,42 @@ def read_csv_sheets(path):
             with path.open("r", newline="", encoding=enc) as f:
                 sample = f.read(8192)
                 f.seek(0)
-                try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-                except Exception:
-                    dialect = csv.excel
-                rows = [
-                    {(_clean(k) or f"column_{i}"): _clean(v)
-                     for i, (k, v) in enumerate(r.items()) if k is not None}
-                    for r in csv.DictReader(f, dialect=dialect)
-                ]
-            return [(path.stem, rows)]
+                delim = sniff_delimiter(sample)
+                reader = csv.reader(f, delimiter=delim)
+                table = [r for r in reader]
         except UnicodeDecodeError:
             continue
         except Exception as e:
             raise SystemExit(f"Could not read {path.name}: {e}")
+
+        if not table:
+            return [(path.stem, [])]
+
+        # same header logic as Excel: skip a title line above the real header
+        class _C:                       # tiny shim so find_header_row can be shared
+            def __init__(self, v): self.value = v
+        grid = [[_C(v) for v in r] for r in table]
+        start = find_header_row(grid)
+
+        width = 0
+        for r in table[start:]:
+            for i, v in enumerate(r):
+                if _clean(v):
+                    width = max(width, i + 1)
+        if not width:
+            return [(path.stem, [])]
+
+        header = dedupe_headers([_clean(v) or f"column_{i+1}"
+                                 for i, v in enumerate(table[start][:width])])
+        rows = []
+        for r in table[start + 1:]:
+            vals = list(r)[:width]
+            if not any(_clean(v) for v in vals):
+                continue
+            rows.append({header[i]: _clean(v) for i, v in enumerate(vals)
+                         if i < len(header)})
+        return [(path.stem, rows)]
+
     raise SystemExit(f"Could not decode {path.name} with any known encoding.")
 
 
@@ -137,6 +185,77 @@ def row_color(cells, header_len):
     return max(seen.items(), key=lambda kv: kv[1])[0]
 
 
+def _is_number(v):
+    try:
+        float(str(v).replace(",", ".").replace(" ", ""))
+        return True
+    except Exception:
+        return False
+
+
+def _looks_like_header(row):
+    """Headings are words; a data row is often mostly numbers."""
+    vals = [_clean(c.value) for c in row]
+    vals = [v for v in vals if v]
+    if not vals:
+        return False
+    return sum(1 for v in vals if not _is_number(v)) >= max(1, len(vals) // 2)
+
+
+def find_header_row(grid, look=15):
+    """
+    Pick the header row.
+
+    Real sheets often start with a title, a logo or blank rows, so "the first
+    row with anything in it" is frequently wrong - it makes the title the
+    header and demotes the real header to a data row. Take the earliest row
+    that spans about as many columns as the widest row nearby, preferring one
+    that reads like headings rather than figures. Allowing one column of slack
+    keeps a header that has a blank cell or two from losing to a full data row.
+    """
+    scan = grid[:look]
+    counts = [sum(1 for c in row if _clean(c.value)) for row in scan]
+    if not counts or max(counts) == 0:
+        return 0
+    threshold = max(1, max(counts) - 1)
+    for i, n in enumerate(counts):
+        if n >= threshold and _looks_like_header(scan[i]):
+            return i
+    for i, n in enumerate(counts):
+        if n >= threshold:
+            return i
+    return 0
+
+
+def dedupe_headers(names):
+    """Excel and CSV both allow repeated headings; keep them all."""
+    seen, out = {}, []
+    for n in names:
+        if n in seen:
+            seen[n] += 1
+            out.append(f"{n}_{seen[n]}")
+        else:
+            seen[n] = 1
+            out.append(n)
+    return out
+
+
+def _merged_lookup(ws):
+    """Value of the top-left cell for every coordinate inside a merged range."""
+    filled = {}
+    try:
+        for rng in ws.merged_cells.ranges:
+            top = ws.cell(row=rng.min_row, column=rng.min_col).value
+            if top is None:
+                continue
+            for r in range(rng.min_row, rng.max_row + 1):
+                for c in range(rng.min_col, rng.max_col + 1):
+                    filled[(r, c)] = top
+    except Exception:
+        pass
+    return filled
+
+
 def read_excel_sheets(path):
     """Every worksheet becomes its own (sheet_name, rows) pair."""
     try:
@@ -156,21 +275,39 @@ def read_excel_sheets(path):
         if not grid:
             out.append((ws.title, []))
             continue
-        # first non-empty row is the header
-        start = 0
-        for i, row in enumerate(grid):
-            if any(_clean(c.value) for c in row):
-                start = i
-                break
-        header = [_clean(c.value) or f"column_{i+1}"
-                  for i, c in enumerate(grid[start])]
+
+        merged = _merged_lookup(ws)
+
+        def val(cell):
+            v = cell.value
+            if v is None:
+                v = merged.get((cell.row, cell.column))
+            return _clean(v)
+
+        start = find_header_row(grid)
+
+        # Ignore columns that are entirely empty from the header down. Stray
+        # cell formatting, images and charts inflate the sheet's width, which
+        # otherwise invents column_7, column_8 ... full of nothing.
+        width = 0
+        for row in grid[start:]:
+            for i, c in enumerate(row):
+                if val(c):
+                    width = max(width, i + 1)
+        if not width:
+            out.append((ws.title, []))
+            continue
+
+        header = dedupe_headers([val(c) or f"column_{i+1}"
+                                 for i, c in enumerate(grid[start][:width])])
+
         rows = []
         for raw in grid[start + 1:]:
-            if not any(_clean(c.value) for c in raw):
-                continue  # skip blank separator rows
-            row = {header[i]: _clean(c.value)
-                   for i, c in enumerate(raw) if i < len(header)}
-            color = row_color(list(raw), len(header))
+            cells = list(raw)[:width]
+            if not any(val(c) for c in cells):
+                continue  # blank separator row
+            row = {header[i]: val(c) for i, c in enumerate(cells) if i < len(header)}
+            color = row_color(cells, len(header))
             if color:
                 row[COLOR_KEY] = color
             rows.append(row)
@@ -232,7 +369,7 @@ def row_to_item(row, name_col, qty_col):
 # ---------------------------------------------------------------------------
 
 def import_file(path, base_category=None, only_sheet=None, dry_run=False,
-                parent=None, quiet=False):
+                parent=None, quiet=False, name_col=None, qty_col=None):
     """
     Import one spreadsheet. Returns a summary dict.
 
@@ -274,8 +411,9 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False,
 
         header = [k for k in (sheet_rows[0].keys() if sheet_rows else [])
                   if k != COLOR_KEY]
-        name_col = pick_column(header, NAME_HINTS)
-        qty_col = pick_column(header, QTY_HINTS)
+        # an explicit choice always wins over the guess
+        name_col = (name_col if name_col in header else None) or pick_column(header, NAME_HINTS)
+        qty_col = (qty_col if qty_col in header else None) or pick_column(header, QTY_HINTS)
         colored = sum(1 for r in sheet_rows if r.get(COLOR_KEY))
 
         cat_map.setdefault(top, [])
@@ -304,7 +442,7 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False,
         added_total += count
         summary.append((cat_path, count, name_col, qty_col,
                         [h for h in header if h not in (name_col, qty_col)],
-                        colored))
+                        colored, header))
 
     result = {
         "file": path.name,
@@ -314,7 +452,7 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False,
         "colored": sum(s[5] for s in summary),
         "categories": [{"path": s[0], "items": s[1], "name_from": s[2],
                         "quantity_from": s[3], "extra_fields": s[4],
-                        "colored": s[5]} for s in summary],
+                        "colored": s[5], "columns": s[6]} for s in summary],
         "saved": False,
     }
 
@@ -327,7 +465,7 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False,
         print(f"  Category      : {top}")
         print(f"  Data folder   : {inv.get_data_dir()}")
         print()
-        for cat_path, count, name_col, qty_col, extras, colored in summary:
+        for cat_path, count, name_col, qty_col, extras, colored, _hdr in summary:
             print(f"  {cat_path}")
             print(f"      items       : {count}")
             print(f"      name from   : {name_col or '(first non-empty column)'}")
@@ -483,6 +621,10 @@ def main():
                     help="path to a .csv / .xlsx file, or a folder of them")
     ap.add_argument("--category", help="import under this category name")
     ap.add_argument("--sheet", help="import only this sheet (single file only)")
+    ap.add_argument("--name-col", dest="name_col",
+                    help="column to use as the item name (default: auto-detect)")
+    ap.add_argument("--qty-col", dest="qty_col",
+                    help="column to use as the quantity (default: auto-detect)")
     ap.add_argument("--under", help="folder import: nest everything under this category")
     ap.add_argument("--recursive", action="store_true",
                     help="folder import: include subfolders, mirroring them as categories")
@@ -500,7 +642,8 @@ def main():
                       recursive=args.recursive, dry_run=args.dry_run)
     else:
         import_file(target, base_category=args.category,
-                    only_sheet=args.sheet, dry_run=args.dry_run)
+                    only_sheet=args.sheet, dry_run=args.dry_run,
+                    name_col=args.name_col, qty_col=args.qty_col)
     return 0
 
 

@@ -43,6 +43,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Bulk import** | Import every spreadsheet in a folder at once, with a preview first |
 | **Safe for teams** | A shared lock stops simultaneous saves overwriting each other |
 | **Who changed what** | Every change records the person who made it |
+| **Updates optional** | Automatic update checks can be switched off |
 
 ---
 
@@ -231,8 +232,12 @@ You can also click **Import file** in the app header to do the same thing throug
 
 It figures out the messy parts for you:
 
-- **Finds the name and quantity columns automatically** — recognises `name`, `item`, `title`, `description`, `qty`, `quantity`, `amount`, and German equivalents (`Bezeichnung`, `Menge`, `Anzahl`).
-- **Detects the delimiter** — comma, semicolon, tab or pipe.
+- **You choose the name and quantity columns.** The importer suggests them, but the preview lets you pick before anything is written (`--name-col` / `--qty-col` from the command line).
+- **Finds a sensible suggestion automatically** — recognises `name`, `item`, `title`, `description`, `qty`, `quantity`, `amount`, and German equivalents (`Bezeichnung`, `Menge`, `Anzahl`).
+- **Detects the delimiter** — comma, semicolon, tab or pipe — by checking which one splits the file consistently, rather than trusting a guess from the first line.
+- **Finds the real header row**, skipping a title, a logo or blank rows above it.
+- **Ignores empty columns** invented by stray formatting, images or charts, and keeps repeated headings apart (`Value`, `Value_2`) instead of dropping one.
+- **Reads merged cells** using the value you can see in them.
 - **Handles encodings** — UTF-8, UTF-8-BOM and Latin-1, so umlauts and accents survive.
 - Every other column becomes a custom field; blank rows and empty sheets are skipped.
 - A plain `.csv` has no sheets, so it becomes a single category named after the file.
@@ -325,6 +330,8 @@ The PDF is generated directly by the app, so no extra libraries are needed. Set 
 The version number in the header doubles as an update button. On startup the app quietly asks GitHub whether a newer version exists; if there is one, the badge lights up as **"Update available"**.
 
 Clicking it shows what you have, what's published, and the recent commit messages. **Update now** downloads the repository archive and replaces the program files, then offers to restart.
+
+To switch the update check off, untick **check for updates automatically** at the bottom of the update dialog — or set `INVENTORY_NO_UPDATE=1`. Adding `"updates_disabled": true` to `inventory_config.json` turns it off for everyone using a shared copy.
 
 Publishing a new version is just:
 

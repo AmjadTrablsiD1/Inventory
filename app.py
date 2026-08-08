@@ -205,7 +205,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -1467,11 +1467,41 @@ def _version_tuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", str(v))[:4]) or (0,)
 
 
+def updates_enabled():
+    """Automatic update checks can be switched off per machine or for everyone."""
+    if os.environ.get("INVENTORY_NO_UPDATE", "").strip() not in ("", "0"):
+        return False
+    if load_portable_config().get("updates_disabled"):
+        return False
+    return not load_config().get("updates_disabled", False)
+
+
+def set_updates_enabled(on, everyone=False):
+    if everyone:
+        cfg = load_portable_config()
+        if on:
+            cfg.pop("updates_disabled", None)
+        else:
+            cfg["updates_disabled"] = True
+        save_portable_config(cfg)
+    cfg = load_config()
+    if on:
+        cfg.pop("updates_disabled", None)
+    else:
+        cfg["updates_disabled"] = True
+    save_config(cfg)
+    return updates_enabled()
+
+
 def check_for_update():
     """Ask GitHub what the latest version is. Never raises."""
     repo = github_repo()
     info = {"repo": repo, "branch": UPDATE_BRANCH, "current": APP_VERSION,
-            "latest": None, "update_available": False, "commits": [], "error": None}
+            "latest": None, "update_available": False, "commits": [],
+            "error": None, "enabled": updates_enabled()}
+    if not info["enabled"]:
+        info["error"] = "Update checking is switched off."
+        return info
     try:
         # version string in the published app.py
         raw_url = (f"https://raw.githubusercontent.com/{repo}/"
@@ -1629,6 +1659,7 @@ def api_state():
                 "dir_source": data_dir_source(),
                 "app_dir": str(APP_DIR),
                 "me": machine_identity(),
+                "updates_enabled": updates_enabled(),
                 "data_version": data_version(),
             }
         )
@@ -2236,6 +2267,14 @@ def api_update_check():
     return jsonify(check_for_update())
 
 
+@APP.route("/api/update/setting", methods=["POST"])
+def api_update_setting():
+    data = request.get_json(force=True)
+    on = bool(data.get("enabled"))
+    everyone = bool(data.get("everyone"))
+    return jsonify({"ok": True, "enabled": set_updates_enabled(on, everyone)})
+
+
 @APP.route("/api/update/apply", methods=["POST"])
 def api_update_apply():
     with LOCK:
@@ -2271,13 +2310,18 @@ def api_import_file():
     with LOCK:
         try:
             import import_data  # imported lazily: import_data imports this module
-            r = import_data.import_file(path, quiet=True)
+            r = import_data.import_file(
+                path, quiet=True,
+                name_col=(data.get("name_col") or None),
+                qty_col=(data.get("qty_col") or None),
+                dry_run=bool(data.get("preview")))
         except SystemExit as e:
             return jsonify({"error": str(e)}), 400
         except Exception as e:
             return jsonify({"error": f"Import failed: {e}"}), 400
     return jsonify({"ok": True, "imported": r["added"], "file": r["file"],
-                    "categories": [c["path"] for c in r["categories"]]})
+                    "path": r["path"], "preview": bool(data.get("preview")),
+                    "categories": r["categories"]})
 
 
 @APP.route("/api/import_folder", methods=["POST"])
@@ -2498,6 +2542,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
     text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);
     white-space:nowrap;max-width:320px;overflow:hidden;text-overflow:ellipsis;
   }
+  /* show the full text of long values instead of clipping them to one line */
+  table.wrap td{white-space:normal;overflow:visible;text-overflow:clip;
+                word-break:break-word;vertical-align:top;}
+  table.wrap td.col-name{min-width:220px;max-width:380px;}
   th{
     position:sticky;top:0;background:var(--panel-2);color:var(--muted);
     font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;z-index:1;
@@ -2528,6 +2576,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .pickwrap{display:inline-flex;align-items:center;margin-right:9px;vertical-align:middle;}
   .rowpick,#selAll{cursor:pointer;margin:0;}
 
+  .hidden-note{
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    padding:8px 14px;margin:8px;border-radius:8px;font-size:13px;
+    background:var(--accent-soft);border:1px solid var(--accent);
+  }
   .refresh-bar{
     display:flex;align-items:center;gap:10px;padding:8px 18px;font-size:13px;
     background:var(--accent-soft);border-bottom:1px solid var(--accent);
@@ -2644,6 +2697,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <span class="spacer" style="flex:1"></span>
         <label class="check"><input type="checkbox" id="includeSub" onchange="loadItems()"> include subcategories</label>
         <label class="check"><input type="checkbox" id="fillRows" onchange="toggleFillRows()"> fill whole row with colour</label>
+        <label class="check"><input type="checkbox" id="wrapText" onchange="toggleWrap()"> wrap long text</label>
         <button class="btn small ghost" onclick="openColumnsModal()" title="Rename, reorder, hide or delete columns">Columns</button>
         <input class="search" id="search" placeholder="Search…" oninput="debouncedLoad()">
       </div>
@@ -2844,6 +2898,12 @@ function readableOn(hex){
   const r=parseInt(h.slice(0,2),16), g=parseInt(h.slice(2,4),16), b=parseInt(h.slice(4,6),16);
   return ((0.299*r + 0.587*g + 0.114*b)/255) > 0.6 ? "#111" : "#fff";
 }
+let WRAP_TEXT = (function(){ try{ return localStorage.getItem("inv_wrap")==="1"; }catch(e){ return false; } })();
+function toggleWrap(){
+  WRAP_TEXT = $("#wrapText").checked;
+  try{ localStorage.setItem("inv_wrap", WRAP_TEXT?"1":"0"); }catch(e){}
+  const t=document.querySelector("#tableWrap table"); if(t) t.classList.toggle("wrap", WRAP_TEXT);
+}
 function toggleFillRows(){
   FILL_ROWS = $("#fillRows").checked;
   try{ localStorage.setItem("inv_fill_rows", FILL_ROWS?"1":"0"); }catch(e){}
@@ -2987,6 +3047,11 @@ async function moveColumn(col, dir){
   [order[i],order[j]]=[order[j],order[i]];
   await saveColSettings({order:["name",...order]});
   toast(`Moved "${COL_LABEL(col)}" ${dir<0?"left":"right"}`);
+}
+
+async function unhideAll(){
+  await saveColSettings({hidden:[]});
+  toast("All hidden columns are showing again");
 }
 
 async function hideColumn(col){
@@ -3166,6 +3231,10 @@ function renderTable(items, customFields){
   const CS = (STATE.columns||{labels:{},hidden:[],order:[]});
   const ord=CS.order||[], hidden=CS.hidden||[];
   cols = [...ord.filter(c=>cols.includes(c)), ...cols.filter(c=>!ord.includes(c))];
+  // a column hidden earlier stays hidden when a later import recreates the same
+  // name, which looks exactly like "the import lost my data" - so say so plainly
+  const hiddenWithData = hidden.filter(c =>
+        c!=="name" && items.some(it=>String(it[c]||"").trim()!==""));
   cols = cols.filter(c=>c==="name" || !hidden.includes(c));
   ALL_COLUMNS = [...new Set([...cols, ...usedCustom, "quantity","category_path",
                              "status","used_note","date_added","last_modified"])];
@@ -3213,7 +3282,14 @@ function renderTable(items, customFields){
     html+="</tr>";
   });
   html+="</tbody></table>";
+  if(hiddenWithData.length){
+    html = `<div class="hidden-note">${hiddenWithData.length} column(s) with data are hidden:
+      <b>${hiddenWithData.map(c=>esc(COL_LABEL(c))).join(", ")}</b>
+      <button class="btn small" onclick="unhideAll()">Show them</button>
+      <button class="btn small ghost" onclick="openColumnsModal()">Columns…</button></div>` + html;
+  }
   wrap.innerHTML=html;
+  if(WRAP_TEXT){ const t=wrap.querySelector("table"); if(t) t.classList.add("wrap"); }
 
   // ---- wiring ----
   const byId = id => items.find(x=>x.id===id);
@@ -3826,7 +3902,18 @@ function paintVersionBadge(){
   }
 }
 
+async function setUpdateEnabled(on){
+  try{
+    await api("/api/update/setting",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({enabled:on})});
+    toast(on?"Update checking on":"Update checking off");
+    await loadState();
+    if(!on){ UPDATE_INFO=null; paintVersionBadge(); }
+  }catch(e){ toast(e.error||"Failed","err"); }
+}
+
 async function checkUpdateQuietly(){
+  if(STATE.updates_enabled===false) return;
   try{
     UPDATE_INFO = await api("/api/update/check");
     paintVersionBadge();
@@ -3835,7 +3922,10 @@ async function checkUpdateQuietly(){
 
 async function openUpdateModal(){
   const body=`<div id="updBody"><p class="muted">Checking GitHub…</p></div>`;
-  const foot=`<button class="btn ghost" onclick="closeModal()">Close</button>
+  const foot=`<label class="check" style="margin-right:auto"><input type="checkbox" id="updAuto"
+      ${STATE.updates_enabled===false?"":"checked"} onchange="setUpdateEnabled(this.checked)">
+      check for updates automatically</label>
+    <button class="btn ghost" onclick="closeModal()">Close</button>
     <button class="btn primary" id="updBtn" style="display:none">Update now</button>`;
   const m=modalShell("Software update", body, foot); showModal(m);
 
@@ -3923,12 +4013,45 @@ function openImportModal(){
 
   m.querySelector("#impFile").onclick=async()=>{
     res.innerHTML=`<p class="muted">Choose a file in the dialog…</p>`;
+    confirmBtn.style.display="none";
     try{
-      const r=await api("/api/import_file",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      // preview first, so the column mapping can be corrected before saving
+      const r=await api("/api/import_file",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({preview:true})});
       if(r.cancelled){ res.innerHTML=""; return; }
-      res.innerHTML=`<p><b>Imported ${r.imported} item(s)</b> from ${esc(r.file)}</p>
-        <p class="muted">${(r.categories||[]).map(esc).join("<br>")}</p>`;
-      toast(`Imported ${r.imported} item(s)`); loadState();
+      const cats=r.categories||[];
+      const cols=(cats[0]||{}).columns||[];
+      const sel=(id,chosen)=>`<select id="${id}" style="max-width:190px">
+          <option value="">— none —</option>
+          ${cols.map(c=>`<option value="${esc(c)}" ${c===chosen?"selected":""}>${esc(c)}</option>`).join("")}
+        </select>`;
+      res.innerHTML=`
+        <p><b>${esc(r.file)}</b> — ${r.imported} item(s) in
+           ${cats.length} categor${cats.length===1?"y":"ies"}.</p>
+        <div class="custom-row" style="margin-top:10px">
+          <div class="field" style="margin:0"><label>Use as item name</label>${sel("mapName",(cats[0]||{}).name_from)}</div>
+          <div class="field" style="margin:0"><label>Use as quantity</label>${sel("mapQty",(cats[0]||{}).quantity_from)}</div>
+        </div>
+        <div style="max-height:150px;overflow:auto;margin-top:8px">
+          ${cats.map(c=>`<div class="upd-row"><span class="sha">${c.items}×</span>
+            <span>${esc(c.path)}<br><span class="muted">${(c.extra_fields||[]).map(esc).join(", ")||"no extra columns"}</span></span></div>`).join("")}
+        </div>
+        <p class="muted" style="margin-top:8px">Nothing has been written yet.</p>`;
+      pending={file:r.path};
+      confirmBtn.textContent="Import"; confirmBtn.style.display="";
+      confirmBtn.onclick=async()=>{
+        confirmBtn.disabled=true; confirmBtn.textContent="Importing…";
+        try{
+          const done=await api("/api/import_file",{method:"POST",headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({path:r.path,
+              name_col:m.querySelector("#mapName").value,
+              qty_col:m.querySelector("#mapQty").value})});
+          res.innerHTML=`<p><b>Imported ${done.imported} item(s)</b> from ${esc(done.file)}</p>`;
+          toast(`Imported ${done.imported} item(s)`);
+          confirmBtn.style.display="none"; pending=null; loadState();
+        }catch(e){ res.innerHTML=`<p class="muted">${esc(e.error||"Import failed")}</p>`; }
+        confirmBtn.disabled=false; confirmBtn.textContent="Import";
+      };
     }catch(e){ res.innerHTML=`<p class="muted">${esc(e.error||"Import failed")}</p>`; }
   };
 
@@ -4085,6 +4208,7 @@ function openDirModal(){
 }
 
 $("#fillRows").checked = FILL_ROWS;     // restore the colour-display preference
+$("#wrapText").checked = WRAP_TEXT;
 loadState();
 setTimeout(checkUpdateQuietly, 1500);   // background check, silent if offline
 setInterval(checkForOthers, 7000);      // notice saves made on another computer

@@ -205,7 +205,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.13.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -2763,6 +2763,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     margin:14px;padding:14px 16px;border-radius:10px;font-size:13px;
     background:var(--accent-soft);border:1px solid var(--danger);
   }
+  .quick-add{margin:10px 14px;padding:10px 12px;border-radius:9px;
+             background:var(--panel-2);border:1px solid var(--accent);}
+  .quick-head{display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:8px;flex-wrap:wrap;}
+  .quick-row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;}
+  .quick-field{display:flex;flex-direction:column;gap:3px;min-width:130px;}
+  .quick-field label{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px;}
+  .quick-field input{background:var(--bg);border:1px solid var(--line);color:var(--text);
+                     padding:7px 9px;border-radius:6px;font-size:13px;font-family:inherit;}
+  .pin{background:none;border:none;padding:0 2px;font-size:11px;opacity:.28;cursor:pointer;
+       filter:grayscale(1);}
+  .pin.on{opacity:1;filter:none;}
   .subcats{padding:12px 14px 4px;}
   .subcats-head{font-size:12px;color:var(--muted);margin-bottom:8px;}
   .subcat-grid{display:flex;flex-wrap:wrap;gap:8px;}
@@ -2896,6 +2907,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <label class="check"><input type="checkbox" id="includeSub" onchange="loadItems()"> include subcategories</label>
         <label class="check"><input type="checkbox" id="fillRows" onchange="toggleFillRows()"> fill whole row with colour</label>
         <label class="check"><input type="checkbox" id="wrapText" onchange="toggleWrap()"> wrap long text</label>
+        <button class="btn small ghost" id="quickBtn" onclick="toggleQuickAdd()" title="Add rows one after another, keeping the values you pin">Quick add</button>
         <button class="btn small ghost" onclick="openColumnsModal()" title="Rename, reorder, hide or delete columns">Columns</button>
         <input class="search" id="search" placeholder="Search…" oninput="debouncedLoad()">
       </div>
@@ -3129,6 +3141,100 @@ function toggleFillRows(){
   FILL_ROWS = $("#fillRows").checked;
   try{ localStorage.setItem("inv_fill_rows", FILL_ROWS?"1":"0"); }catch(e){}
   loadItems();
+}
+
+// ---------- quick add: type a row, press Enter, repeat ----------
+// Values with the pin on stay for the next row, so shared details like a
+// serial prefix, a link or a location are typed once rather than every time.
+let QUICK={open:false, values:{}, pins:{}};
+
+function toggleQuickAdd(){
+  QUICK.open=!QUICK.open;
+  loadItems();
+}
+
+function quickAddHtml(customCols){
+  if(!QUICK.open) return "";
+  const cols=["name","quantity",...customCols];
+  const label={name:"Name",quantity:"Qty"};
+  const pinOn=c=>QUICK.pins[c]!==undefined ? QUICK.pins[c] : (c!=="name");
+  return `<div class="quick-add">
+    <div class="quick-head">
+      Adding to <b>${esc(SELECTED||"All items (no category)")}</b>
+      <span class="muted">— Enter saves and starts the next row. A pinned 📌 value is kept.</span>
+      <span style="flex:1"></span>
+      <button class="btn small ghost" onclick="toggleQuickAdd()">Close</button>
+    </div>
+    <div class="quick-row">
+      ${cols.map(c=>`<div class="quick-field">
+          <label>${esc(label[c]||COL_LABEL(c))}
+            <button class="pin ${pinOn(c)?"on":""}" data-pin="${esc(c)}"
+              title="${pinOn(c)?"Kept for the next row":"Cleared after each row"}">📌</button></label>
+          <input class="qf" data-f="${esc(c)}" value="${esc(QUICK.values[c]||"")}"
+                 placeholder="${c==="quantity"?"1":""}">
+        </div>`).join("")}
+      <button class="btn primary" id="quickSave">Add</button>
+    </div></div>`;
+}
+
+function wireQuickAdd(wrap){
+  if(!QUICK.open) return;
+  wrap.querySelectorAll(".qf").forEach(inp=>{
+    inp.oninput=()=>{ QUICK.values[inp.dataset.f]=inp.value; };
+    inp.onkeydown=e=>{ if(e.key==="Enter"){ e.preventDefault(); quickAddSave(); } };
+  });
+  wrap.querySelectorAll("[data-pin]").forEach(b=>{
+    b.onclick=()=>{
+      const c=b.dataset.pin;
+      QUICK.pins[c]=!(QUICK.pins[c]!==undefined ? QUICK.pins[c] : (c!=="name"));
+      b.classList.toggle("on", QUICK.pins[c]);
+      b.title=QUICK.pins[c]?"Kept for the next row":"Cleared after each row";
+    };
+  });
+  const save=wrap.querySelector("#quickSave");
+  if(save) save.onclick=quickAddSave;
+  const first=wrap.querySelector('.qf[data-f="name"]');
+  if(first && !QUICK.values.name) first.focus();
+}
+
+async function quickAddSave(){
+  const v=QUICK.values;
+  const name=String(v.name||"").trim();
+  if(!name){ toast("Name is required","err"); return; }
+  const fields={name, quantity:String(v.quantity||"1").trim()||"1",
+                category_path:SELECTED||""};
+  Object.keys(v).forEach(k=>{
+    if(k!=="name" && k!=="quantity" && String(v[k]||"").trim()) fields[k]=v[k];
+  });
+  try{
+    await api("/api/item",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:"",fields})});
+    // clear anything not pinned, keep the rest for the next row
+    Object.keys(v).forEach(k=>{
+      const pinned = QUICK.pins[k]!==undefined ? QUICK.pins[k] : (k!=="name");
+      if(!pinned) v[k]="";
+    });
+    v.name="";
+    toast(`Added "${name}"`);
+    await loadState();
+    const f=document.querySelector('.qf[data-f="name"]'); if(f) f.focus();
+  }catch(e){ toast(e.error||"Failed","err"); }
+}
+
+async function duplicateItem(id){
+  const it=(LAST_ITEMS||[]).find(x=>x.id===id);
+  if(!it) return;
+  const fields={};
+  Object.keys(it).forEach(k=>{
+    if(["id","date_added","last_modified","modified_by"].includes(k)) return;
+    if(String(it[k]||"").trim()) fields[k]=it[k];
+  });
+  fields.name=(it.name||"")+" (copy)";
+  try{
+    await api("/api/item",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({id:"",fields})});
+    toast("Duplicated"); loadState();
+  }catch(e){ toast(e.error||"Failed","err"); }
 }
 
 // ---------- selection ----------
@@ -3406,6 +3512,7 @@ function openRowMenu(x, y, it){
   const entries=[
     ["✎ Edit…",            ()=>editItem(it.id),                 n===1],
     ["✏️ Rename…",          ()=>renameSelected(),                n===1],
+    ["⧉ Duplicate",         ()=>duplicateItem(it.id),            n===1],
     ["⇄ Move to category…", ()=>bulkMove(),                      true],
     ["🎨 Set colour…",      ()=>bulkColor(),                     true],
     [used?"↩ Return to stock":"✔ Mark as used",
@@ -3484,7 +3591,8 @@ function renderTable(items, customFields){
   const wrap=$("#tableWrap");
   const subs=subcategoriesHtml();
   if(!items.length){
-    wrap.innerHTML = subs + `<div class="empty-state">
+    wrap.innerHTML = subs + quickAddHtml(customFields.filter(f=>items.some(it=>(it[f]||"").trim()!=="")))
+      + `<div class="empty-state">
       <h3>${subs?"No items directly in this category":"No items here"}</h3>
       <p>${subs?"The items are in the subcategories above — open one, or tick "
                 +"<b>include subcategories</b> to see them all together."
@@ -3566,7 +3674,7 @@ function renderTable(items, customFields){
     html+="</tr>";
   });
   html+="</tbody></table>";
-  html = subs + html;
+  html = subs + quickAddHtml(usedCustom) + html;
   if(hiddenWithData.length){
     html = `<div class="hidden-note">${hiddenWithData.length} column(s) with data are hidden:
       <b>${hiddenWithData.map(c=>esc(COL_LABEL(c))).join(", ")}</b>
@@ -3574,6 +3682,7 @@ function renderTable(items, customFields){
       <button class="btn small ghost" onclick="openColumnsModal()">Columns…</button></div>` + html;
   }
   wrap.innerHTML=html;
+  wireQuickAdd(wrap);
   if(WRAP_TEXT){ const t=wrap.querySelector("table"); if(t) t.classList.add("wrap"); }
 
   // ---- wiring ----
@@ -3731,7 +3840,24 @@ function askConfirm(opts){
     m.querySelector("#askYes").focus();
   });
 }
-$("#overlay").addEventListener("click",e=>{if(e.target===$("#overlay"))closeModal();});
+// Clicking the backdrop used to throw away whatever had been typed. Anything
+// with unsaved input now asks first; empty forms still close instantly.
+function modalIsDirty(){
+  const m=$("#overlay").firstChild;
+  if(!m || m.dataset.guard!=="1") return false;
+  return [...m.querySelectorAll("input,select,textarea")].some(el=>{
+    if(el.type==="checkbox"||el.type==="radio") return el.checked!==el.defaultChecked;
+    return (el.value||"") !== (el.dataset.initial!==undefined ? el.dataset.initial : el.defaultValue||"");
+  });
+}
+async function closeModalGuarded(){
+  if(!modalIsDirty()) return closeModal();
+  const go=await askConfirm({title:"Discard what you typed?",
+    message:"This form has unsaved changes.",
+    okLabel:"Discard", cancelLabel:"Keep editing", danger:true});
+  if(go) closeModal();
+}
+$("#overlay").addEventListener("click",e=>{ if(e.target===$("#overlay")) closeModalGuarded(); });
 
 function modalShell(title, bodyHtml, footHtml){
   const m=document.createElement("div"); m.className="modal";
@@ -3887,7 +4013,10 @@ async function buildItemModal(item){
   const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
     <button class="btn primary" id="saveItem">${isEdit?"Save changes":"Add item"}</button>`;
   const m=modalShell(isEdit?"Edit item":"New item", body, foot);
+  m.dataset.guard="1";                       // don't lose typing to a stray click
   showModal(m);
+  setTimeout(()=>m.querySelectorAll("input,select,textarea")
+      .forEach(el=>{ if(el.dataset.initial===undefined) el.dataset.initial=el.value||""; }),0);
 
   const renderCustom=()=>{
     const c=m.querySelector("#customFields");

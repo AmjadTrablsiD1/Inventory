@@ -24,6 +24,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 |---|---|
 | **Dynamic category tree** | Unlimited nesting, browsable from the tree or the main panel |
 | **Dynamic item fields** | Add fields per item, typed as Text / Number / Date / Notes |
+| **Quick add** | Type row after row, keeping the values you pin — no dialog per item |
 | **Required-field templates** | Per category, inherited by subcategories |
 | **Auto-save** | Every change written to CSV immediately |
 | **Change history** | Timestamped log of every add, edit, move and delete |
@@ -269,6 +270,16 @@ Always try `--dry-run` first on a file you care about — it prints the full map
 **Right-click** any row for the same actions as a context menu. Right-clicking inside a selection acts on the whole selection; right-clicking outside it selects that one row first. The **⋯** button on each row opens the same menu if you prefer clicking.
 
 **Nothing runs away from you.** The checkbox and item name are pinned to the left of the table and the action buttons are pinned to the right, so no matter how many custom columns you have or how far you scroll sideways, you can always see which row you are about to act on.
+
+---
+
+## Adding several similar items
+
+**Quick add** in the toolbar opens a single row above the table with a box for the name, the quantity and every extra column in view. Type, press **Enter**, and the item is saved and the row is ready for the next one.
+
+Each box has a **pin**. A pinned value stays for the next row, so shared details — a link, a supplier, a location, a serial prefix — are typed once instead of every time. Everything except the name is pinned by default; click a pin to turn it off. **Duplicate** in a row's right-click menu copies an existing item outright.
+
+> Nothing typed is lost by accident: clicking outside the item form asks before discarding, and **Keep editing** puts the form back exactly as it was.
 
 ---
 

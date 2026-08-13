@@ -112,7 +112,11 @@ Put the app folder on the share and let everyone run that same copy. When you se
 
 If the data folder sits inside or beside the app folder on the share, the setting is stored as a **relative** path — so it still works when the share is mounted as `Z:\` on one machine and `/Volumes/share` on another.
 
-**It also works with no setting at all.** If the data folder sits next to `app.py` (or beside it on the share), any copy of the app finds it automatically by looking for `inventory.csv` nearby — so a second person opening the app on the share sees the same inventory even if nobody ever saved a shared setting. Once found, the app writes the shared setting itself so the arrangement becomes explicit.
+**The location is recorded, not searched for.** The first time anyone opens the app with a data folder that lives with the app, that location is written into `inventory_config.json` next to `app.py` — so from then on every computer opens exactly that folder. There is no hunting around.
+
+Before anything has been recorded, the app checks **three fixed locations only**, in this order: `InventoryData` inside the app folder, `InventoryData` beside it, then the app folder itself. It never searches the drive for a folder that happens to contain an inventory — picking the wrong one is how data appears to go missing.
+
+If your data folder is somewhere else entirely, open **Data folder** and press **Save for everyone**: it records whatever folder you are using now as the one everybody opens.
 
 Where the setting comes from, in order:
 
@@ -126,6 +130,12 @@ Where the setting comes from, in order:
 If the app folder on the share is **read-only**, the shared setting cannot be written and the app says so in a dialog rather than a passing message — otherwise everyone else keeps looking at their own empty folder. In that case, keep the data folder next to `app.py` so it is found automatically.
 
 The **Data folder** dialog shows which of these is currently in effect.
+
+### If the drive is not connected
+
+If the recorded folder cannot be reached — the share is not mounted, the drive letter did not come back — the app **stops and says so**. It does not quietly create a fresh empty inventory somewhere else, because that looks exactly like losing your data and leaves a second inventory to reconcile later. Editing is blocked until the folder is reachable again; nothing is written in the meantime.
+
+The app still starts, so you can read the message, press **Try again** once the drive is connected, or pick another folder.
 
 ### Two people at once
 

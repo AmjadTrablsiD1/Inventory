@@ -205,7 +205,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -369,41 +369,18 @@ _DISCOVERED = {"path": None, "done": False}
 
 def discover_data_dir():
     """
-    Find an inventory sitting next to the app, without anyone configuring it.
-
-    This is what makes a shared drive work out of the box: whoever opens the
-    copy of app.py on the share gets the data that is already there, even if
-    the person who set it up never saved a shared setting (or could not,
-    because the folder was read-only).
+    The only place the app looks when nothing has been recorded yet: two fixed
+    locations, checked in a fixed order. It never searches around for some
+    folder that happens to contain an inventory - picking the wrong one is how
+    data appears to go missing. Whatever is found here is written into the
+    shared setting straight away, so this runs once and never again.
     """
     if _DISCOVERED["done"]:
         return _DISCOVERED["path"]
     _DISCOVERED["done"] = True
-
-    names = ("InventoryData", "Inventory Data", "data", "Data", "inventory_data")
-    roots = [APP_DIR, APP_DIR.parent]
-    candidates = []
-    for root in roots:
-        for n in names:
-            candidates.append(root / n)
-        candidates.append(root)                 # data files beside app.py itself
-    try:                                        # any nearby folder holding an inventory
-        for root in roots:
-            for child in sorted(root.iterdir()):
-                if child.is_dir():
-                    candidates.append(child)
-    except Exception:
-        pass
-
-    seen = set()
-    for c in candidates:
-        try:
-            key = str(c.resolve())
-        except Exception:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
+    for c in (APP_DIR / "InventoryData",          # inside the app folder
+              APP_DIR.parent / "InventoryData",   # beside it, the layout we document
+              APP_DIR):                            # data files next to app.py
         try:
             if (c / INVENTORY_CSV).is_file():
                 _DISCOVERED["path"] = c
@@ -759,32 +736,79 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+class DataFolderUnavailable(Exception):
+    """The recorded data folder cannot be reached right now."""
+
+
+def data_dir_status():
+    """
+    Decide whether it is safe to use the recorded folder.
+
+    If the folder is recorded but its parent is missing - a share that is not
+    mounted, a drive letter that did not come back - the app must NOT quietly
+    make a fresh empty inventory somewhere else. That is what makes people
+    think their data is gone, and it leaves a second inventory behind to be
+    merged later.
+    """
+    d = get_data_dir()
+    src = data_dir_source()
+    recorded = src["scope"] in ("env", "user", "shared")
+    try:
+        if d.is_dir():
+            return {"ok": True, "state": "ready", "path": str(d), "source": src}
+        parent = d.parent
+        if parent.is_dir():
+            return {"ok": True, "state": "will_create", "path": str(d), "source": src}
+        if recorded:
+            return {"ok": False, "state": "unreachable", "path": str(d), "source": src,
+                    "message": f"The data folder recorded for this app cannot be reached:\n{d}\n\n"
+                               "If it is on a shared drive, connect the drive and try again. "
+                               "Nothing has been changed, and no new inventory has been created."}
+        return {"ok": True, "state": "will_create", "path": str(d), "source": src}
+    except Exception as e:
+        return {"ok": False, "state": "error", "path": str(d), "source": src,
+                "message": f"Could not check the data folder: {e}"}
+
+
 _SELF_HEAL = {"done": False}
+
+
+def on_the_share(path):
+    """True if the folder lives with the app rather than on one person's PC."""
+    try:
+        p, a = Path(path).resolve(), APP_DIR.resolve()
+        return str(p).startswith(str(a)) or str(p).startswith(str(a.parent))
+    except Exception:
+        return False
 
 
 def self_heal_shared_setting():
     """
-    If the data was found next to the app but nobody ever saved the shared
-    setting, write it now so the arrangement is explicit and survives someone
-    later pointing their own copy elsewhere.
+    Record the data folder for everyone the first time anyone uses it, so a
+    second person never has to hunt for it. Only a folder that lives with the
+    app is recorded automatically - one person's local folder is no use to
+    anybody else, and the Data folder screen offers a button for that case.
     """
     if _SELF_HEAL["done"]:
         return
     _SELF_HEAL["done"] = True
     try:
-        if env_data_dir() or portable_data_dir():
+        if env_data_dir() or portable_data_dir() or not app_dir_writable():
             return
-        found = discover_data_dir()
-        if found and app_dir_writable():
-            set_data_dir(found, "shared")
-            log_history("data_folder", str(found),
-                        "found next to the app and saved for everyone")
+        current = get_data_dir()
+        if on_the_share(current) and (current / INVENTORY_CSV).is_file():
+            set_data_dir(current, "shared")
+            log_history("data_folder", str(current),
+                        "recorded next to the app so every computer uses it")
     except Exception:
         pass
 
 
 def ensure_files():
     """Create the data folder and empty CSVs if they don't exist yet."""
+    status = data_dir_status()
+    if not status["ok"]:
+        raise DataFolderUnavailable(status["message"])
     d, inv, cats, hist = paths()
     d.mkdir(parents=True, exist_ok=True)
     if not inv.exists():
@@ -1736,9 +1760,26 @@ def apply_update():
 # API routes
 # ----------------------------------------------------------------------------
 
+@APP.errorhandler(DataFolderUnavailable)
+def _data_folder_unavailable(e):
+    return jsonify({"error": str(e), "data_unavailable": True,
+                    "status": data_dir_status()}), 503
+
+
 @APP.route("/api/state")
 def api_state():
     with LOCK:
+        status = data_dir_status()
+        if not status["ok"]:
+            return jsonify({"data_status": status, "data_unavailable": True,
+                            "version": APP_VERSION, "tree": [], "custom_fields": [],
+                            "base_columns": BASE_COLUMNS, "item_count": 0,
+                            "data_dir": status["path"], "columns": read_col_settings(),
+                            "me": machine_identity(), "dir_source": status["source"],
+                            "app_dir": str(APP_DIR),
+                            "app_dir_writable": app_dir_writable(),
+                            "shared_config": str(portable_config_file()),
+                            "shared_config_exists": portable_config_file().exists()}), 200
         self_heal_shared_setting()
         ensure_files()
         rows, custom = read_inventory()
@@ -1759,6 +1800,7 @@ def api_state():
                 "app_dir_writable": app_dir_writable(),
                 "shared_config": str(portable_config_file()),
                 "shared_config_exists": portable_config_file().exists(),
+                "data_status": status,
                 "app_dir": str(APP_DIR),
                 "me": machine_identity(),
                 "updates_enabled": updates_enabled(),
@@ -2471,6 +2513,24 @@ def api_import_folder():
     })
 
 
+@APP.route("/api/share_dir", methods=["POST"])
+def api_share_dir():
+    """Record the folder in use right now as the one everybody should open."""
+    with LOCK:
+        d = get_data_dir()
+        if not app_dir_writable():
+            return jsonify({"error":
+                f"This copy of the app cannot save a shared setting because its own "
+                f"folder is read-only:\n{APP_DIR}\n\nAsk for write access to that "
+                f"folder, or keep the data folder next to app.py."}), 400
+        used = set_data_dir(d, "shared")
+        if used != "shared":
+            return jsonify({"error": "The shared setting could not be written."}), 400
+        log_history("data_folder", str(d), "saved for every computer")
+        return jsonify({"ok": True, "data_dir": str(d),
+                        "file": str(portable_config_file())})
+
+
 @APP.route("/api/set_dir", methods=["POST"])
 def api_set_dir():
     with LOCK:
@@ -2698,6 +2758,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .pickwrap{display:inline-flex;align-items:center;margin-right:9px;vertical-align:middle;}
   .rowpick,#selAll{cursor:pointer;margin:0;}
 
+  .data-problem{
+    display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;
+    margin:14px;padding:14px 16px;border-radius:10px;font-size:13px;
+    background:var(--accent-soft);border:1px solid var(--danger);
+  }
   .hidden-note{
     display:flex;align-items:center;gap:10px;flex-wrap:wrap;
     padding:8px 14px;margin:8px;border-radius:8px;font-size:13px;
@@ -2958,9 +3023,32 @@ async function api(url, opts){
 }
 function esc(s){return (s==null?"":String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
+// ---------- data folder problems ----------
+function showDataProblem(st){
+  st = st||{};
+  let el=$("#dataProblem");
+  if(!el){
+    el=document.createElement("div"); el.id="dataProblem"; el.className="data-problem";
+    document.querySelector(".content").prepend(el);
+  }
+  el.innerHTML=`<div>
+      <b>The saved data folder cannot be reached.</b>
+      <div class="muted" style="margin-top:6px;white-space:pre-wrap">${esc(st.message||"")}</div>
+      <div class="muted" style="margin-top:6px">Recorded location: <code>${esc(st.path||"")}</code></div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn primary" onclick="loadState()">Try again</button>
+      <button class="btn" onclick="openDirModal()">Choose folder…</button>
+    </div>`;
+  $("#tableWrap").innerHTML="";
+  $("#tree").innerHTML="";
+}
+
 // ---------- state / tree ----------
 async function loadState(){
   STATE = await api("/api/state");
+  if(STATE.data_unavailable){ showDataProblem(STATE.data_status); return; }
+  const pb=$("#dataProblem"); if(pb) pb.remove();
   $("#dataPath").textContent = "· " + STATE.data_dir;
   paintVersionBadge();
   renderTree();
@@ -4366,6 +4454,7 @@ function openDirModal(){
     ${STATE.dir_from_env?`<p class="muted" style="color:var(--accent)">Note: the folder is currently
     fixed by the INVENTORY_DIR environment variable, which overrides this setting for as long as it is set.</p>`:""}`;
   const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
+    <button class="btn" id="shareDir" title="Record the folder in use now so every computer opens it">Save for everyone</button>
     <button class="btn primary" id="saveDir">Use this folder</button>`;
   const m=modalShell("Data folder", body, foot); showModal(m);
   if(canBrowse){
@@ -4379,6 +4468,18 @@ function openDirModal(){
       btn.textContent=old; btn.disabled=false;
     };
   }
+  m.querySelector("#shareDir").onclick=async()=>{
+    try{
+      const r=await api("/api/share_dir",{method:"POST"});
+      toast("Saved — every computer will open this folder");
+      closeModal(); loadState();
+    }catch(e){
+      await askConfirm({title:"Could not save it for everyone",
+        message:esc(e.error||"Unknown error").replace(/\n/g,"<br>"),
+        okLabel:"I understand", cancelLabel:"Close"});
+    }
+  };
+
   m.querySelector("#saveDir").onclick=async()=>{
     const path=m.querySelector("#dirInput").value.trim();
     const scope=m.querySelector("#dirShared").checked?"shared":"user";
@@ -4419,7 +4520,13 @@ def _open_browser(url):
 
 
 if __name__ == "__main__":
-    ensure_files()
+    # A missing data folder must not stop the app from starting: it needs to
+    # come up so the browser can explain the problem and offer to fix it.
+    try:
+        ensure_files()
+    except DataFolderUnavailable as e:
+        if sys.stderr is not None:
+            sys.stderr.write(f"\n[Inventory Manager] {e}\n\n")
     HOST = "127.0.0.1"
     # NOTE: not 5000 — on macOS the AirPlay Receiver (Control Center) permanently
     # occupies port 5000, so binding there fails with "address already in use".

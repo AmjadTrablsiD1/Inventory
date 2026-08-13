@@ -112,13 +112,18 @@ Put the app folder on the share and let everyone run that same copy. When you se
 
 If the data folder sits inside or beside the app folder on the share, the setting is stored as a **relative** path — so it still works when the share is mounted as `Z:\` on one machine and `/Volumes/share` on another.
 
+**It also works with no setting at all.** If the data folder sits next to `app.py` (or beside it on the share), any copy of the app finds it automatically by looking for `inventory.csv` nearby — so a second person opening the app on the share sees the same inventory even if nobody ever saved a shared setting. Once found, the app writes the shared setting itself so the arrangement becomes explicit.
+
 Where the setting comes from, in order:
 
 1. `INVENTORY_DIR` environment variable
 2. this computer's own choice, if it was saved with the box unticked
 3. `inventory_config.json` next to `app.py` — the shared setting
-4. this computer's own choice
-5. `~/InventoryData`
+4. an inventory found next to `app.py`
+5. this computer's own choice from an older version
+6. `~/InventoryData`
+
+If the app folder on the share is **read-only**, the shared setting cannot be written and the app says so in a dialog rather than a passing message — otherwise everyone else keeps looking at their own empty folder. In that case, keep the data folder next to `app.py` so it is found automatically.
 
 The **Data folder** dialog shows which of these is currently in effect.
 

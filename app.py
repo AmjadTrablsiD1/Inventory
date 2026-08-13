@@ -205,7 +205,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.11.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -364,15 +364,69 @@ def portable_data_dir():
     return Path(d).expanduser() if d else None
 
 
+_DISCOVERED = {"path": None, "done": False}
+
+
+def discover_data_dir():
+    """
+    Find an inventory sitting next to the app, without anyone configuring it.
+
+    This is what makes a shared drive work out of the box: whoever opens the
+    copy of app.py on the share gets the data that is already there, even if
+    the person who set it up never saved a shared setting (or could not,
+    because the folder was read-only).
+    """
+    if _DISCOVERED["done"]:
+        return _DISCOVERED["path"]
+    _DISCOVERED["done"] = True
+
+    names = ("InventoryData", "Inventory Data", "data", "Data", "inventory_data")
+    roots = [APP_DIR, APP_DIR.parent]
+    candidates = []
+    for root in roots:
+        for n in names:
+            candidates.append(root / n)
+        candidates.append(root)                 # data files beside app.py itself
+    try:                                        # any nearby folder holding an inventory
+        for root in roots:
+            for child in sorted(root.iterdir()):
+                if child.is_dir():
+                    candidates.append(child)
+    except Exception:
+        pass
+
+    seen = set()
+    for c in candidates:
+        try:
+            key = str(c.resolve())
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if (c / INVENTORY_CSV).is_file():
+                _DISCOVERED["path"] = c
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def forget_discovery():
+    _DISCOVERED.update({"path": None, "done": False})
+
+
 def get_data_dir():
     """
     Where the CSVs live, in order of precedence:
-      1. INVENTORY_DIR                        - explicit, wins over everything
-      2. this machine's setting, if it was    - "just this computer" choice
-         saved with override_shared
-      3. the config next to app.py            - shared drive: same for everyone
-      4. this machine's setting
-      5. ~/InventoryData
+      1. INVENTORY_DIR                     - explicit, wins over everything
+      2. this machine's setting, if saved  - a deliberate "just this computer"
+         with override_shared                choice
+      3. the config next to app.py         - shared drive: same for everyone
+      4. an inventory found next to app.py - shared drive with nothing set up
+      5. this machine's setting            - legacy/incidental
+      6. ~/InventoryData
     """
     env = env_data_dir()
     if env:
@@ -386,6 +440,10 @@ def get_data_dir():
     if shared:
         return shared
 
+    found = discover_data_dir()
+    if found:
+        return found
+
     return Path(cfg.get("data_dir") or DEFAULT_DIR)
 
 
@@ -398,9 +456,23 @@ def data_dir_source():
         return {"scope": "user", "where": str(CONFIG_FILE)}
     if portable_data_dir():
         return {"scope": "shared", "where": str(portable_config_file())}
+    if discover_data_dir():
+        return {"scope": "found",
+                "where": f"an inventory found next to the app ({discover_data_dir()})"}
     if cfg.get("data_dir"):
         return {"scope": "user", "where": str(CONFIG_FILE)}
     return {"scope": "default", "where": "built-in default"}
+
+
+def app_dir_writable():
+    """Can we save a setting next to app.py for everyone to pick up?"""
+    probe = APP_DIR / ".write_test"
+    try:
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+        return True
+    except Exception:
+        return False
 
 
 def set_data_dir(path, scope="shared"):
@@ -430,12 +502,14 @@ def set_data_dir(path, scope="shared"):
             cfg.pop("data_dir_relative", None)
             cfg["data_dir"] = str(path)
         if save_portable_config(cfg):
+            forget_discovery()
             user = load_config()
             user.pop("override_shared", None)   # stop overriding the shared one
             user["data_dir"] = str(path)        # harmless fallback copy
             save_config(user)
             return "shared"
 
+    forget_discovery()
     user = load_config()
     user["data_dir"] = str(path)
     user["override_shared"] = True
@@ -683,6 +757,30 @@ def pick_file_native():
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+_SELF_HEAL = {"done": False}
+
+
+def self_heal_shared_setting():
+    """
+    If the data was found next to the app but nobody ever saved the shared
+    setting, write it now so the arrangement is explicit and survives someone
+    later pointing their own copy elsewhere.
+    """
+    if _SELF_HEAL["done"]:
+        return
+    _SELF_HEAL["done"] = True
+    try:
+        if env_data_dir() or portable_data_dir():
+            return
+        found = discover_data_dir()
+        if found and app_dir_writable():
+            set_data_dir(found, "shared")
+            log_history("data_folder", str(found),
+                        "found next to the app and saved for everyone")
+    except Exception:
+        pass
 
 
 def ensure_files():
@@ -1641,6 +1739,7 @@ def apply_update():
 @APP.route("/api/state")
 def api_state():
     with LOCK:
+        self_heal_shared_setting()
         ensure_files()
         rows, custom = read_inventory()
         tree = build_tree()
@@ -1657,6 +1756,9 @@ def api_state():
                 "dir_from_env": bool(env_data_dir()),
                 "columns": read_col_settings(),
                 "dir_source": data_dir_source(),
+                "app_dir_writable": app_dir_writable(),
+                "shared_config": str(portable_config_file()),
+                "shared_config_exists": portable_config_file().exists(),
                 "app_dir": str(APP_DIR),
                 "me": machine_identity(),
                 "updates_enabled": updates_enabled(),
@@ -4254,6 +4356,13 @@ function openDirModal(){
     the right choice when the app lives on a shared drive, because every laptop then finds the same data.
     Unticked, it applies only to this computer.</p>
     <p class="muted">Currently taken from: ${esc((STATE.dir_source||{}).where||"—")}</p>
+    ${STATE.app_dir_writable===false?`<p class="muted" style="color:var(--danger)">
+      <b>This copy of the app cannot save a shared setting.</b><br>
+      ${esc(STATE.app_dir||"")} is read-only, so other computers will not pick up your choice.
+      Put the data folder next to app.py (or ask for write access to that folder) and everyone
+      will find it automatically.</p>`:""}
+    ${STATE.shared_config_exists?`<p class="muted">Shared setting file: ${esc(STATE.shared_config||"")}</p>`
+      :`<p class="muted">No shared setting saved yet — tick the box above to create one.</p>`}
     ${STATE.dir_from_env?`<p class="muted" style="color:var(--accent)">Note: the folder is currently
     fixed by the INVENTORY_DIR environment variable, which overrides this setting for as long as it is set.</p>`:""}`;
   const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
@@ -4275,10 +4384,20 @@ function openDirModal(){
     const scope=m.querySelector("#dirShared").checked?"shared":"user";
     try{const r=await api("/api/set_dir",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({path,scope})});
-      let msg = r.migrated ? "Data folder set · existing data copied" : "Data folder set";
-      if(r.shared_failed) msg += " (couldn't write next to app.py — saved for this computer only)";
-      else if(r.scope==="shared") msg += " · shared with every computer";
-      toast(msg); closeModal(); loadState();
+      if(r.shared_failed){
+        // do not let this scroll past in a toast: it is the whole reason other
+        // machines end up looking at their own empty folder
+        await askConfirm({title:"Saved for this computer only",
+          message:`The folder was set, but the setting could <b>not</b> be written next to app.py:<br>`
+                 +`<code>${esc(STATE.app_dir||"")}</code><br><br>`
+                 +`Other computers will not pick it up. Either give that folder write access, or `
+                 +`keep the data folder next to app.py so every copy finds it automatically.`,
+          okLabel:"I understand", cancelLabel:"Close"});
+      }else{
+        toast((r.migrated?"Data folder set · existing data copied":"Data folder set")
+              + (r.scope==="shared"?" · shared with every computer":""));
+      }
+      closeModal(); loadState();
     }catch(e){toast(e.error||"Failed","err");}
   };
 }

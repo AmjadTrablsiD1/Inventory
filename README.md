@@ -22,7 +22,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 
 | | |
 |---|---|
-| **Dynamic category tree** | Unlimited nesting, rename/move/delete with item-safety checks |
+| **Dynamic category tree** | Unlimited nesting, browsable from the tree or the main panel |
 | **Dynamic item fields** | Add fields per item, typed as Text / Number / Date / Notes |
 | **Required-field templates** | Per category, inherited by subcategories |
 | **Auto-save** | Every change written to CSV immediately |
@@ -269,6 +269,14 @@ Always try `--dry-run` first on a file you care about — it prints the full map
 **Right-click** any row for the same actions as a context menu. Right-clicking inside a selection acts on the whole selection; right-clicking outside it selects that one row first. The **⋯** button on each row opens the same menu if you prefer clicking.
 
 **Nothing runs away from you.** The checkbox and item name are pinned to the left of the table and the action buttons are pinned to the right, so no matter how many custom columns you have or how far you scroll sideways, you can always see which row you are about to act on.
+
+---
+
+## Browsing categories
+
+Clicking a category shows its **subcategories as cards** at the top of the panel, with the number of items in each — so a category whose items all live one level down no longer looks empty. Click a card to go into it; the tree on the left opens to match.
+
+A category that has both its own items and subcategories shows the cards above the items. Tick **include subcategories** to see everything together in one list instead.
 
 ---
 

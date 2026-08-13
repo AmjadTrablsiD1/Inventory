@@ -205,7 +205,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -2763,6 +2763,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     margin:14px;padding:14px 16px;border-radius:10px;font-size:13px;
     background:var(--accent-soft);border:1px solid var(--danger);
   }
+  .subcats{padding:12px 14px 4px;}
+  .subcats-head{font-size:12px;color:var(--muted);margin-bottom:8px;}
+  .subcat-grid{display:flex;flex-wrap:wrap;gap:8px;}
+  .subcat{
+    display:flex;flex-direction:column;align-items:flex-start;gap:2px;
+    background:var(--panel-2);border:1px solid var(--line);color:var(--text);
+    padding:8px 12px;border-radius:8px;font-size:13px;min-width:130px;text-align:left;
+  }
+  .subcat:hover{border-color:var(--accent);}
+  .subcat-name{font-weight:600;}
+  .subcat-count{font-size:11px;color:var(--muted);}
   .hidden-note{
     display:flex;align-items:center;gap:10px;flex-wrap:wrap;
     padding:8px 14px;margin:8px;border-radius:8px;font-size:13px;
@@ -3084,7 +3095,7 @@ function renderNode(node){
   const [addBtn,reqBtn,renBtn,delBtn]=row.querySelectorAll(".node-actions .icon-btn");
   const twist=row.querySelector(".twist");
   twist.onclick=e=>{e.stopPropagation(); if(!hasKids)return; open?EXPANDED.delete(node.path):EXPANDED.add(node.path); renderTree();};
-  row.onclick=()=>{SELECTED=node.path;renderTree();loadItems();};
+  row.onclick=()=>{ if(hasKids) EXPANDED.add(node.path); SELECTED=node.path; renderTree(); loadItems(); };
   addBtn.onclick=e=>{e.stopPropagation();addCategory(node.path);};
   reqBtn.onclick=e=>{e.stopPropagation();openRequiredModal(node);};
   renBtn.onclick=e=>{e.stopPropagation();renameCategory(node);};
@@ -3433,11 +3444,51 @@ async function loadItems(){
   renderTable(data.items, data.custom_fields);
 }
 
+function findNode(path, nodes){
+  for(const n of (nodes||STATE.tree||[])){
+    if(n.path===path) return n;
+    const hit=findNode(path, n.children); if(hit) return hit;
+  }
+  return null;
+}
+
+// A category whose items all live in its subcategories used to look empty.
+// Show the subcategories so the tree can be walked from the main panel too.
+function subcategoriesHtml(){
+  if(!SELECTED) return "";
+  const node=findNode(SELECTED);
+  if(!node || !node.children || !node.children.length) return "";
+  return `<div class="subcats">
+    <div class="subcats-head">${node.children.length} subcategor${node.children.length===1?"y":"ies"} in
+      <b>${esc(node.name)}</b></div>
+    <div class="subcat-grid">
+      ${node.children.map(ch=>`
+        <button class="subcat" onclick='openCategory(${JSON.stringify(ch.path)})'>
+          <span class="subcat-name">${esc(ch.name)}</span>
+          <span class="subcat-count">${ch.count} item${ch.count===1?"":"s"}${
+            ch.children&&ch.children.length?` · ${ch.children.length} sub`:""}</span>
+        </button>`).join("")}
+    </div></div>`;
+}
+
+function openCategory(path){
+  SELECTED=path;
+  EXPANDED.add(path);
+  (path||"").split("/").reduce((acc,part)=>{      // open its parents too
+    const p=acc?acc+"/"+part:part; EXPANDED.add(p); return p;
+  },"");
+  renderTree(); loadItems();
+}
+
 function renderTable(items, customFields){
   const wrap=$("#tableWrap");
+  const subs=subcategoriesHtml();
   if(!items.length){
-    wrap.innerHTML=`<div class="empty-state"><h3>No items here</h3>
-      <p>Add an item to this category, or pick another category.</p>
+    wrap.innerHTML = subs + `<div class="empty-state">
+      <h3>${subs?"No items directly in this category":"No items here"}</h3>
+      <p>${subs?"The items are in the subcategories above — open one, or tick "
+                +"<b>include subcategories</b> to see them all together."
+               :"Add an item to this category, or pick another category."}</p>
       <button class="btn primary" onclick="openItemModal()">+ Add item</button></div>`;
     return;
   }
@@ -3515,6 +3566,7 @@ function renderTable(items, customFields){
     html+="</tr>";
   });
   html+="</tbody></table>";
+  html = subs + html;
   if(hiddenWithData.length){
     html = `<div class="hidden-note">${hiddenWithData.length} column(s) with data are hidden:
       <b>${hiddenWithData.map(c=>esc(COL_LABEL(c))).join(", ")}</b>

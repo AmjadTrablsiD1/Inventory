@@ -205,7 +205,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.14.1"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -1356,6 +1356,38 @@ def _fit(text, width, size, avg=_HELV_AVG):
     return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
 
 
+def short_link(url, limit=58):
+    """
+    A readable version of a web address for printing.
+
+    A product URL is routinely 200 characters of tracking parameters, which
+    printed in full runs the width of the page and tells the reader nothing.
+    This keeps the site and the end of the path and drops the rest; the full
+    address stays behind the link, so clicking it still works.
+    """
+    s = str(url or "").strip()
+    if not s:
+        return ""
+    core = re.sub(r"^[a-zA-Z][\w+.-]*://", "", s)      # drop http:// etc
+    core = re.sub(r"^www\.", "", core)
+    core = core.split("#", 1)[0]
+    base, _, query = core.partition("?")
+    base = base.rstrip("/")
+    mark = "…" if query else ""          # something was dropped
+    if len(base) + len(mark) <= limit:
+        return base + mark
+
+    host, _, path = base.partition("/")
+    tail = path.rsplit("/", 1)[-1] if path else ""
+    room = limit - len(host) - 3                        # host + "/…/"
+    if tail and room >= 10:
+        if len(tail) > room:
+            tail = tail[:room - 1]
+        return f"{host}/…/{tail}…" if (len(tail) < len(path.rsplit("/", 1)[-1]) or mark) \
+               else f"{host}/…/{tail}"
+    return base[:max(10, limit - 1)] + "…"
+
+
 def write_order_pdf(path, title, header_note=""):
     """Render the current order list to a PDF at `path`."""
     rows, total = read_order()
@@ -1428,7 +1460,7 @@ def write_order_pdf(path, title, header_note=""):
 
         if r.get("link"):
             y -= 12
-            shown = _fit(r["link"], PAGE_W - x_item - MARGIN, 7.5)
+            shown = _fit(short_link(r["link"]), PAGE_W - x_item - MARGIN, 7.5)
             lines.append("0.20 0.40 0.75 rg")
             txt(x_item, y, shown, 7.5, "F1")
             lines.append("0 g")

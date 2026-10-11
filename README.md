@@ -370,6 +370,8 @@ Export it as:
 - **CSV** — clean columns plus a TOTAL row, ready for a spreadsheet.
 - **PDF** — a tidy printable document with your title and reference note, right-aligned figures, clickable links, and the total. It pages automatically for long lists.
 
+Shop links are usually a couple of hundred characters of tracking parameters, so the PDF prints a short readable form — `reichelt.de/…/raspberry_pi_5_8gb…` — rather than a line of noise running the width of the page. The link still points at the full address when clicked, and the CSV export keeps the address in full.
+
 The PDF is generated directly by the app, so no extra libraries are needed. Set a different currency with `INVENTORY_CURRENCY` (default `€`).
 
 ---

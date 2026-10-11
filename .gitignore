@@ -32,6 +32,7 @@ inventory_config.json
 column_settings.json
 
 # Inventory data — never commit real inventory contents
+backups/
 InventoryData/
 by_category/
 inventory.csv

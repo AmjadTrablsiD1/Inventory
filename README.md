@@ -40,6 +40,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Item colours** | Pick a colour per item — and imports keep the colours from your spreadsheet |
 | **Used, not deleted** | Mark something as used and record where it went, keeping it in the list |
 | **Delete archive** | Deleted items are saved to `deleted_items.csv` with date, reason and details |
+| **Dated backups** | Clean CSV snapshots filed by month, and forced before anything destructive |
 | **Clean CSV export** | Export just your data, with no internal ids or program columns |
 | **Order list** | Build a purchase list with prices and links, export as CSV or PDF |
 | **Bulk import** | Import every spreadsheet in a folder at once, with a preview first |
@@ -132,6 +133,30 @@ Where the setting comes from, in order:
 If the app folder on the share is **read-only**, the shared setting cannot be written and the app says so in a dialog rather than a passing message — otherwise everyone else keeps looking at their own empty folder. In that case, keep the data folder next to `app.py` so it is found automatically.
 
 The **Data folder** dialog shows which of these is currently in effect.
+
+### Backups
+
+Dated snapshots are kept in a `backups/` folder beside your data, **one folder per month**:
+
+```
+InventoryData/backups/
+├── 2026-09/
+│   ├── 2026-09-03_142210_inventory.csv          # clean, opens in Excel
+│   ├── 2026-09-03_142210_inventory_full.csv     # exact copy, for restoring
+│   ├── 2026-09-03_142210_categories.csv
+│   └── 2026-09-27_091500_before-delete_inventory.csv
+└── 2026-10/
+```
+
+Each snapshot holds a **clean CSV** — friendly headings, no internal ids, ready to open in Excel — alongside exact copies of the live files so a snapshot can also be restored as-is.
+
+Snapshots are taken:
+
+- **routinely** as you work, at most one every 15 minutes so ordinary editing does not produce thousands of files;
+- **always before anything destructive**, labelled with the reason: `before-delete`, `before-bulk-delete`, `before-category-delete`, `before-column-delete`, `before-import`, `before-update`. There is therefore always a copy from the moment before the damage.
+- **on demand** with **Back up now** in the Data folder dialog, which also shows how many snapshots exist and when the last one was taken.
+
+Nothing is ever pruned automatically — the files are small and losing them is the thing being guarded against.
 
 ### If the drive is not connected
 

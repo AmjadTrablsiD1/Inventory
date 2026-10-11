@@ -205,7 +205,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.14.1"
+APP_VERSION = "1.15.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -232,6 +232,10 @@ HISTORY_CSV = "history.csv"
 DELETED_CSV = "deleted_items.csv"   # every deleted item is archived here
 ORDER_CSV = "order_list.csv"        # the working "things to order" list
 COLUMNS_JSON = "column_settings.json"   # per-folder column order/labels/hidden
+
+# Dated archive, one folder per month, kept beside the live data.
+BACKUP_DIR = "backups"
+BACKUP_MIN_GAP = 900        # seconds between routine snapshots (15 minutes)
 
 # Shown on order lists and in exports. Change to "$", "CHF", ... as needed.
 CURRENCY = os.environ.get("INVENTORY_CURRENCY", "€")
@@ -584,6 +588,7 @@ def delete_custom_field(name):
         return False, "Built-in columns cannot be deleted - hide it instead."
     if name not in custom:
         return False, f"There is no column called '{name}'."
+    backup_now("before-column-delete")
 
     filled = sum(1 for r in rows if str(r.get(name, "")).strip())
     custom.remove(name)
@@ -854,6 +859,7 @@ def write_inventory(rows, custom_fields, sync_view=True):
             w.writerow(clean)
     if sync_view:
         write_hierarchy()
+        maybe_backup()          # routine, spaced out
 
 
 def read_categories():
@@ -882,6 +888,7 @@ def write_categories(cat_map, sync_view=True):
             w.writerow([path, "|".join(cat_map[path])])
     if sync_view:
         write_hierarchy()
+        maybe_backup()          # routine, spaced out
 
 
 HISTORY_COLUMNS = ["timestamp", "who", "action", "target", "detail"]
@@ -1186,6 +1193,90 @@ def order_export_rows():
             r.get("note", ""),
         ])
     return header, body, total
+
+
+# ----------------------------------------------------------------------------
+# Dated backups
+#
+# Every snapshot is a plain CSV that opens in Excel, filed under the month it
+# was taken. Routine ones are spaced out so ordinary editing does not produce
+# thousands of files; anything destructive forces one first, labelled with the
+# reason, so there is always a copy from immediately before the damage.
+# ----------------------------------------------------------------------------
+
+_LAST_BACKUP = {"at": 0.0}
+
+
+def backup_root():
+    return get_data_dir() / BACKUP_DIR
+
+
+def backup_month_dir(when=None):
+    when = when or datetime.now()
+    return backup_root() / when.strftime("%Y-%m")
+
+
+def backup_now(reason="", quiet=True):
+    """Write a dated set of CSVs into this month's folder. Never raises."""
+    try:
+        when = datetime.now()
+        folder = backup_month_dir(when)
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = when.strftime("%Y-%m-%d_%H%M%S")
+        tag = ("_" + re.sub(r"[^a-zA-Z0-9]+", "-", reason).strip("-")) if reason else ""
+        d, inv, cats, hist = paths()
+
+        # the readable copy: friendly headings, no internal ids
+        header, rows = build_clean_export(include_dates=True, include_used=True,
+                                          include_color=True)
+        with atomic_write(folder / f"{stamp}{tag}_inventory.csv") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(rows)
+
+        # exact copies, so a snapshot can also be restored as-is
+        for src, name in ((inv, "inventory_full.csv"), (cats, "categories.csv"),
+                          (deleted_path(), "deleted_items.csv"),
+                          (order_path(), "order_list.csv")):
+            try:
+                if src.exists():
+                    shutil.copy2(src, folder / f"{stamp}{tag}_{name}")
+            except Exception:
+                pass
+
+        _LAST_BACKUP["at"] = time.time()
+        if not quiet:
+            log_history("backup", str(folder), f"{len(rows)} items{' - ' + reason if reason else ''}")
+        return folder / f"{stamp}{tag}_inventory.csv"
+    except Exception:
+        return None
+
+
+def maybe_backup(reason=""):
+    """A routine snapshot, at most one every BACKUP_MIN_GAP seconds."""
+    if time.time() - _LAST_BACKUP["at"] < BACKUP_MIN_GAP:
+        return None
+    return backup_now(reason)
+
+
+def backup_summary():
+    """What the Data folder screen reports about the archive."""
+    try:
+        root = backup_root()
+        months = sorted([p.name for p in root.iterdir() if p.is_dir()]) if root.is_dir() else []
+        files, newest = 0, None
+        for m in months:
+            for p in (root / m).glob("*_inventory.csv"):
+                files += 1
+                ts = p.stat().st_mtime
+                if newest is None or ts > newest[0]:
+                    newest = (ts, p)
+        return {"folder": str(root), "months": months, "snapshots": files,
+                "latest": (datetime.fromtimestamp(newest[0]).strftime("%Y-%m-%d %H:%M")
+                           if newest else None),
+                "latest_file": str(newest[1]) if newest else None}
+    except Exception:
+        return {"folder": str(backup_root()), "months": [], "snapshots": 0, "latest": None}
 
 
 def read_history(limit=500):
@@ -1694,6 +1785,11 @@ def apply_update():
     import zipfile
     import tempfile
 
+    try:
+        backup_now("before-update")     # the update does not touch data, but a
+    except Exception:                   # snapshot costs nothing and reassures
+        pass
+
     # fail fast and clearly if we could never write the files anyway
     probe = APP_DIR / ".update_write_test"
     try:
@@ -1833,6 +1929,7 @@ def api_state():
                 "shared_config": str(portable_config_file()),
                 "shared_config_exists": portable_config_file().exists(),
                 "data_status": status,
+                "backups": backup_summary(),
                 "app_dir": str(APP_DIR),
                 "me": machine_identity(),
                 "updates_enabled": updates_enabled(),
@@ -1946,6 +2043,7 @@ def api_item_delete():
         if not target:
             return jsonify({"error": "Item not found."}), 404
         reason = (data.get("reason") or "").strip()
+        backup_now("before-delete")              # a copy from just before it goes
         archive_deleted(target, reason)          # keep a permanent record
         rows = [r for r in rows if r.get("id") != item_id]
         write_inventory(rows, custom)
@@ -2008,6 +2106,7 @@ def api_items_bulk():
 
         if action == "delete":
             reason = (data.get("reason") or "").strip()
+            backup_now("before-bulk-delete")
             for t in targets:
                 archive_deleted(t, reason)
             rows = [r for r in rows if r.get("id") not in wanted]
@@ -2379,6 +2478,7 @@ def api_category_delete():
             ), 409
 
         if mode == "recursive":
+            backup_now("before-category-delete")
             # archive them exactly like a normal delete, so nothing vanishes
             # without a record
             for t in affected:
@@ -2549,6 +2649,18 @@ def api_import_folder():
                    "categories": [c["path"] for c in f["categories"]]}
                   for f in r["files"]],
     })
+
+
+@APP.route("/api/backup", methods=["POST"])
+def api_backup():
+    """Take a dated snapshot now."""
+    with LOCK:
+        ensure_files()
+        path = backup_now("manual", quiet=False)
+        if not path:
+            return jsonify({"error": "The backup could not be written. "
+                                     "Check that the data folder is reachable."}), 400
+        return jsonify({"ok": True, "file": str(path), "summary": backup_summary()})
 
 
 @APP.route("/api/share_dir", methods=["POST"])
@@ -4751,7 +4863,18 @@ function openDirModal(){
     ${STATE.shared_config_exists?`<p class="muted">Shared setting file: ${esc(STATE.shared_config||"")}</p>`
       :`<p class="muted">No shared setting saved yet — tick the box above to create one.</p>`}
     ${STATE.dir_from_env?`<p class="muted" style="color:var(--accent)">Note: the folder is currently
-    fixed by the INVENTORY_DIR environment variable, which overrides this setting for as long as it is set.</p>`:""}`;
+    fixed by the INVENTORY_DIR environment variable, which overrides this setting for as long as it is set.</p>`:""}
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0;">
+    <div class="field"><label>Backups</label>
+      <p class="muted" style="margin:0 0 8px">Dated copies are filed by month in
+        <code>${esc((STATE.backups||{}).folder||"")}</code> — each one a plain CSV that opens in Excel.
+        ${(STATE.backups||{}).snapshots
+          ? `<br>${(STATE.backups||{}).snapshots} snapshot(s) across ${((STATE.backups||{}).months||[]).length}
+             month(s): ${((STATE.backups||{}).months||[]).map(esc).join(", ")}.
+             Latest ${esc((STATE.backups||{}).latest||"")}.`
+          : "<br>No snapshots yet."}</p>
+      <button class="btn small" id="backupNow" type="button">Back up now</button>
+    </div>`;
   const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
     <button class="btn" id="shareDir" title="Record the folder in use now so every computer opens it">Save for everyone</button>
     <button class="btn primary" id="saveDir">Use this folder</button>`;
@@ -4767,6 +4890,15 @@ function openDirModal(){
       btn.textContent=old; btn.disabled=false;
     };
   }
+  m.querySelector("#backupNow").onclick=async()=>{
+    const b=m.querySelector("#backupNow"); b.disabled=true; b.textContent="Saving…";
+    try{
+      const r=await api("/api/backup",{method:"POST"});
+      toast("Backup saved");
+      closeModal(); await loadState(); openDirModal();
+    }catch(e){ toast(e.error||"Failed","err"); b.disabled=false; b.textContent="Back up now"; }
+  };
+
   m.querySelector("#shareDir").onclick=async()=>{
     try{
       const r=await api("/api/share_dir",{method:"POST"});

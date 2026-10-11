@@ -95,6 +95,8 @@ python app.py
 
 (use `python3` on macOS/Linux). Then open <http://127.0.0.1:8765> — it opens automatically.
 
+Starting it again while it is already running just opens the browser on the running copy. If that copy is an **older version** — still running from before an update — it is restarted into the new code first, so you never sit looking at yesterday's version wondering where a change went.
+
 > **Note on the port:** the default is **8765**, not the usual 5000, because on modern macOS the AirPlay Receiver permanently occupies port 5000.
 
 ---
@@ -152,7 +154,7 @@ Each snapshot holds a **clean CSV** — friendly headings, no internal ids, read
 
 Snapshots are taken:
 
-- **routinely** as you work, at most one every 15 minutes so ordinary editing does not produce thousands of files;
+- **routinely** as you work, at most one every 15 minutes so ordinary editing does not produce thousands of files. A change made inside that gap is not left waiting for the next save: once the 15 minutes are up it is archived anyway, so the archive is never more than a quarter of an hour behind;
 - **always before anything destructive**, labelled with the reason: `before-delete`, `before-bulk-delete`, `before-category-delete`, `before-column-delete`, `before-import`, `before-update`. There is therefore always a copy from the moment before the damage.
 - **on demand** with **Back up now** in the Data folder dialog, which also shows how many snapshots exist and when the last one was taken.
 
@@ -276,7 +278,7 @@ It figures out the messy parts for you:
 
 - **You choose the name and quantity columns.** The importer suggests them, but the preview lets you pick before anything is written (`--name-col` / `--qty-col` from the command line).
 - **Finds a sensible suggestion automatically** — recognises `name`, `item`, `title`, `description`, `qty`, `quantity`, `amount`, and German equivalents (`Bezeichnung`, `Menge`, `Anzahl`).
-- **Detects the delimiter** — comma, semicolon, tab or pipe — by checking which one splits the file consistently, rather than trusting a guess from the first line.
+- **Detects the delimiter** — comma, semicolon, tab or pipe — by checking which one splits the most lines into the same number of columns, rather than trusting a guess from the first line. A semicolon file from German or other European Excel settings with a title line above the table is read correctly, and leftover lines of bare separators (`,,`) are skipped.
 - **Finds the real header row**, skipping a title, a logo or blank rows above it.
 - **Ignores empty columns** invented by stray formatting, images or charts, and keeps repeated headings apart (`Value`, `Value_2`) instead of dropping one.
 - **Reads merged cells** using the value you can see in them.
@@ -302,6 +304,8 @@ Always try `--dry-run` first on a file you care about — it prints the full map
 ## Editing in the table
 
 Click any cell and type — no window opens. **Enter** saves, **Escape** throws the change away, and **Tab** saves and moves to the next cell along the row (**Shift+Tab** goes back), so a row can be filled in without touching the mouse. Clicking away saves as well.
+
+What you type is never thrown away by the app: the automatic refresh waits while you are typing in a cell, anything else that redraws the table saves the cell first, and closing the window in the middle of an edit still saves it.
 
 The columns the app maintains itself — category, status, the dates and who changed the item — stay read-only, because they are set by the commands that do the rest of the work (**Move to…**, **Mark as used**). Clicking one of those opens the full item window.
 
@@ -419,10 +423,10 @@ Everyone running the app sees the update on their next start.
 **What it will and won't do:**
 
 - It only ever fetches from **one repository** — auto-detected from this checkout's `git remote origin`, falling back to a constant in `app.py`. Override with `INVENTORY_REPO="owner/name"`.
-- Every file it replaces is copied to `backup_before_update_<timestamp>/` first.
-- It only writes files with known source extensions (`.py`, `.md`, `.txt`, `.sh`, `.bat`, `.vbs`, `.applescript`). Anything else in the archive — binaries, `.git`, CI config — is ignored.
+- Every file it replaces is copied to `backup_before_update_<timestamp>/` first, and each new file is written beside the old one and swapped in, so an interrupted update cannot leave a half-written program file behind.
+- It only writes files with known source extensions (`.py`, `.md`, `.txt`, `.sh`, `.bat`, `.vbs`, `.applescript`). Anything else in the archive — binaries, `.git`, CI config, and above all `.csv` and `.json` — is ignored, and nothing is ever written inside `InventoryData/`, `backups/` or `by_category/`, whatever the archive contains.
 - It refuses archives that are corrupt or don't contain `app.py`, and rejects entries with `..` in their paths.
-- **Your inventory data is never touched.** It lives outside the program folder.
+- **Your inventory data is never touched** — not even when the data folder sits next to the program on a shared drive. A `before-update` snapshot is taken anyway.
 - Nothing is downloaded or installed without you clicking Update now. If GitHub is unreachable, the check fails silently and the app works normally.
 
 > Because updates run code from the repository, only point `INVENTORY_REPO` at a repository you control.

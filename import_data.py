@@ -62,21 +62,28 @@ def sniff_delimiter(sample):
     """
     Work out the separator. csv.Sniffer is easily fooled by a file whose first
     line contains commas inside quotes, and answering "comma" for a semicolon
-    file collapses every row into a single column - so its verdict is checked
-    by counting how consistently each candidate splits the first few lines.
+    file collapses every row into a single column. Each candidate is judged by
+    how many lines it splits into the SAME number of columns: the table body
+    agrees with itself, while a title line above it ("Stock list,,") or a stray
+    comma inside a cell does not. Lines that are nothing but separators are
+    ignored - they say nothing about which character the table uses.
     """
-    lines = [l for l in sample.splitlines() if l.strip()][:10]
-    best, best_score = ",", -1
+    lines = [l for l in sample.splitlines() if l.strip()][:30]
+    best, best_score = ",", None
     for d in [",", ";", "\t", "|"]:
-        counts = [len(next(csv.reader([l], delimiter=d))) for l in lines] or [1]
-        fields = max(counts)
-        if fields < 2:
+        counts = {}
+        for l in lines:
+            vals = next(csv.reader([l], delimiter=d), [])
+            if len(vals) < 2 or not any(v.strip() for v in vals):
+                continue
+            counts[len(vals)] = counts.get(len(vals), 0) + 1
+        if not counts:
             continue
-        consistent = sum(1 for c in counts if c == counts[0])
-        score = fields * 10 + consistent          # prefer more, steadier columns
-        if score > best_score:
+        width, agree = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
+        score = (agree, width)               # most agreeing lines, then most columns
+        if best_score is None or score > best_score:
             best, best_score = d, score
-    if best_score < 0:
+    if best_score is None:
         try:
             return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
         except Exception:
@@ -111,7 +118,7 @@ def read_csv_sheets(path):
         width = 0
         for r in table[start:]:
             for i, v in enumerate(r):
-                if _clean(v):
+                if _clean(v).strip(",;|\t "):
                     width = max(width, i + 1)
         if not width:
             return [(path.stem, [])]
@@ -121,7 +128,9 @@ def read_csv_sheets(path):
         rows = []
         for r in table[start + 1:]:
             vals = list(r)[:width]
-            if not any(_clean(v) for v in vals):
+            # blank, or only the separators of an empty row written with a
+            # different delimiter (",," in a semicolon file)
+            if not any(_clean(v).strip(",;|\t ") for v in vals):
                 continue
             rows.append({header[i]: _clean(v) for i, v in enumerate(vals)
                          if i < len(header)})
@@ -147,8 +156,11 @@ def cell_color(cell):
             return ""
         if color.type == "rgb" and isinstance(color.rgb, str):
             rgb = color.rgb
-            if len(rgb) == 8:          # AARRGGBB - drop the alpha
-                if rgb[:2] == "00":    # fully transparent = no fill
+            if len(rgb) == 8:          # AARRGGBB
+                # Excel ignores the alpha byte of a fill, and many programs
+                # write it as 00, so it must not be read as "transparent".
+                # 00000000 is openpyxl's empty default, not a black fill.
+                if rgb == "00000000":
                     return ""
                 rgb = rgb[2:]
             if len(rgb) == 6 and re.fullmatch(r"[0-9A-Fa-f]{6}", rgb):
@@ -369,7 +381,8 @@ def row_to_item(row, name_col, qty_col):
 # ---------------------------------------------------------------------------
 
 def import_file(path, base_category=None, only_sheet=None, dry_run=False,
-                parent=None, quiet=False, name_col=None, qty_col=None):
+                parent=None, quiet=False, name_col=None, qty_col=None,
+                snapshot=True):
     """
     Import one spreadsheet. Returns a summary dict.
 
@@ -489,6 +502,8 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False,
             print("  No rows with usable data were found - nothing imported.\n")
         return result
 
+    if snapshot:
+        inv.backup_now("before-import")        # the state from just before
     inv.write_categories(cat_map, sync_view=False)
     inv.write_inventory(rows, custom)          # this rebuilds by_category/ too
     inv.log_history("import_file", top,
@@ -563,6 +578,8 @@ def import_folder(folder, under=None, recursive=False, dry_run=False,
         print(f"  {len(files)} file(s) found")
         print("=" * 66)
 
+    if not dry_run:
+        inv.backup_now("before-import")        # once, before the first file
     results, total, failed = [], 0, []
     for f in files:
         # subfolder path becomes a parent category when recursing
@@ -573,7 +590,8 @@ def import_folder(folder, under=None, recursive=False, dry_run=False,
                 sub = "/".join(p.replace("/", "-") for p in rel.parts)
                 parent = f"{under}/{sub}" if under else sub
         try:
-            r = import_file(f, parent=parent, dry_run=dry_run, quiet=True)
+            r = import_file(f, parent=parent, dry_run=dry_run, quiet=True,
+                            snapshot=False)
             results.append(r)
             total += r["added"]
             if not quiet:
@@ -637,13 +655,16 @@ def main():
         ap.print_help()
         return 1
 
-    if Path(target).expanduser().is_dir():
-        import_folder(target, under=args.under or args.category,
-                      recursive=args.recursive, dry_run=args.dry_run)
-    else:
-        import_file(target, base_category=args.category,
-                    only_sheet=args.sheet, dry_run=args.dry_run,
-                    name_col=args.name_col, qty_col=args.qty_col)
+    # Someone may be saving in the app at this moment; queue behind them like
+    # any other computer would, rather than overwriting their change.
+    with inv.LOCK:
+        if Path(target).expanduser().is_dir():
+            import_folder(target, under=args.under or args.category,
+                          recursive=args.recursive, dry_run=args.dry_run)
+        else:
+            import_file(target, base_category=args.category,
+                        only_sheet=args.sheet, dry_run=args.dry_run,
+                        name_col=args.name_col, qty_col=args.qty_col)
     return 0
 
 

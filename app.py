@@ -33,6 +33,7 @@ import threading
 import subprocess
 import contextlib
 import webbrowser
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -205,7 +206,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.15.1"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -896,15 +897,19 @@ HISTORY_COLUMNS = ["timestamp", "who", "action", "target", "detail"]
 
 def migrate_history(hist):
     """Add the 'who' column to a history file written by an older version."""
+    # Runs on every request, so look at the heading only; the whole file is
+    # read just once, on the day it actually needs converting.
     try:
         with hist.open("r", newline="", encoding="utf-8-sig") as f:
-            rows = list(csv.reader(f))
+            first = next(csv.reader(f), None)
     except Exception:
         return
-    if not rows or rows[0] == HISTORY_COLUMNS:
+    if not first or first == HISTORY_COLUMNS:
         return
-    if rows[0][:1] != ["timestamp"]:
+    if first[:1] != ["timestamp"]:
         return                                  # not ours - leave it alone
+    with hist.open("r", newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
     with atomic_write(hist) as f:
         w = csv.writer(f)
         w.writerow(HISTORY_COLUMNS)
@@ -1204,7 +1209,7 @@ def order_export_rows():
 # reason, so there is always a copy from immediately before the damage.
 # ----------------------------------------------------------------------------
 
-_LAST_BACKUP = {"at": 0.0}
+_LAST_BACKUP = {"at": 0.0, "pending": False}
 
 
 def backup_root():
@@ -1219,6 +1224,10 @@ def backup_month_dir(when=None):
 def backup_now(reason="", quiet=True):
     """Write a dated set of CSVs into this month's folder. Never raises."""
     try:
+        # Never invent a data folder (or an empty archive) on a drive that is
+        # not connected, or before there is anything to keep.
+        if not data_dir_status()["ok"] or not (get_data_dir() / INVENTORY_CSV).is_file():
+            return None
         when = datetime.now()
         folder = backup_month_dir(when)
         folder.mkdir(parents=True, exist_ok=True)
@@ -1245,6 +1254,7 @@ def backup_now(reason="", quiet=True):
                 pass
 
         _LAST_BACKUP["at"] = time.time()
+        _LAST_BACKUP["pending"] = False
         if not quiet:
             log_history("backup", str(folder), f"{len(rows)} items{' - ' + reason if reason else ''}")
         return folder / f"{stamp}{tag}_inventory.csv"
@@ -1255,8 +1265,26 @@ def backup_now(reason="", quiet=True):
 def maybe_backup(reason=""):
     """A routine snapshot, at most one every BACKUP_MIN_GAP seconds."""
     if time.time() - _LAST_BACKUP["at"] < BACKUP_MIN_GAP:
+        _LAST_BACKUP["pending"] = True      # archived by the catch-up below
         return None
     return backup_now(reason)
+
+
+def _backup_catch_up():
+    """
+    Changes made soon after a snapshot would otherwise reach the archive only
+    with the next save - perhaps days later, if the app is closed. This keeps
+    the archive at most one gap behind whatever was changed.
+    """
+    while True:
+        time.sleep(60)
+        try:
+            if (_LAST_BACKUP["pending"]
+                    and time.time() - _LAST_BACKUP["at"] >= BACKUP_MIN_GAP):
+                with LOCK:
+                    backup_now()
+        except Exception:
+            pass
 
 
 def backup_summary():
@@ -1277,6 +1305,34 @@ def backup_summary():
                 "latest_file": str(newest[1]) if newest else None}
     except Exception:
         return {"folder": str(backup_root()), "months": [], "snapshots": 0, "latest": None}
+
+
+def last_history():
+    """The newest history entry, read from the end of the file.
+
+    Every open window asks for this every few seconds; reading the whole,
+    ever-growing history over a network share each time would slow everyone
+    down as the years go by.
+    """
+    _, _, _, hist = paths()
+    try:
+        with hist.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            tail = f.read().decode("utf-8", "replace")
+    except Exception:
+        return {}
+    for line in reversed(tail.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            vals = next(csv.reader([line]))
+        except Exception:
+            continue
+        if len(vals) >= len(HISTORY_COLUMNS) and vals[0] != "timestamp":
+            return dict(zip(HISTORY_COLUMNS, vals))
+    return {}
 
 
 def read_history(limit=500):
@@ -1668,7 +1724,9 @@ def sanitize_field_name(name):
 # Files the updater is allowed to write. Anything else in the archive is ignored.
 UPDATABLE_SUFFIXES = {".py", ".md", ".txt", ".sh", ".bat", ".vbs",
                       ".applescript", ".gitignore", ""}
-UPDATE_SKIP = {".git", ".github", "__pycache__", ".claude", ".DS_Store"}
+UPDATE_SKIP = {".git", ".github", "__pycache__", ".claude", ".DS_Store",
+               # data folders: never written by an update, whatever is in it
+               "InventoryData", BACKUP_DIR, HIER_DIR}
 
 
 def github_repo():
@@ -1867,7 +1925,11 @@ def apply_update():
             else:
                 added.append(rel)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
+            # write beside it, then swap: an interrupted update can never
+            # leave a half-written program file that refuses to start
+            tmp = target.with_name(f".{target.name}.update.tmp")
+            tmp.write_bytes(content)
+            os.replace(str(tmp), str(target))
     except Exception as e:
         return False, f"Update failed while writing files: {e}", {
             "backup": str(backup), "changed": changed, "added": added}
@@ -1977,7 +2039,14 @@ def api_item_save():
         rows, custom = read_inventory()
 
         item_id = data.get("id") or ""
-        fields = data.get("fields", {})  # {column: value}
+        # {column: value}. Headings are cleaned the same way the column itself
+        # is, so a value can never land under a name that is not saved, and
+        # the columns the app maintains cannot be overwritten from outside.
+        fields = {}
+        for k, v in (data.get("fields") or {}).items():
+            k = sanitize_field_name(str(k))
+            if k and k not in ("id", "date_added", "last_modified", "modified_by"):
+                fields[k] = "" if v is None else str(v)
         category = (fields.get("category_path") or "").strip()
         name = (fields.get("name") or "").strip()
 
@@ -1993,7 +2062,7 @@ def api_item_save():
         # discover any new custom columns
         for key in fields.keys():
             if key not in BASE_COLUMNS and key not in custom:
-                custom.append(sanitize_field_name(key))
+                custom.append(key)
 
         ts = now_str()
         if item_id:
@@ -2012,7 +2081,10 @@ def api_item_save():
                 k for k in fields
                 if str(old.get(k, "")) != str(fields.get(k, ""))
             ]
-            log_history("edit_item", f"{category}/{name}",
+            # a single-cell edit carries only that cell, so name the item from
+            # the saved row rather than from the request
+            log_history("edit_item",
+                        f"{found.get('category_path', '')}/{found.get('name', '')}",
                         "changed: " + ", ".join(changed) if changed else "no field changes")
         else:
             new_id = uuid.uuid4().hex[:12]
@@ -2178,13 +2250,15 @@ def api_ping():
     """Polled by the browser to notice changes made on another computer."""
     last = {}
     try:
-        rows = read_history(1)
-        if rows:
-            last = {"who": rows[0].get("who", ""), "action": rows[0].get("action", ""),
-                    "target": rows[0].get("target", ""), "at": rows[0].get("timestamp", "")}
+        h = last_history()
+        if h:
+            last = {"who": h.get("who", ""), "action": h.get("action", ""),
+                    "target": h.get("target", ""), "at": h.get("timestamp", "")}
     except Exception:
         pass
-    return jsonify({"version": data_version(), "last": last, "me": machine_identity()})
+    return jsonify({"version": data_version(), "last": last, "me": machine_identity(),
+                    "app": "inventory-manager", "app_version": APP_VERSION,
+                    "app_dir": str(APP_DIR)})
 
 
 @APP.route("/api/identity", methods=["GET", "POST"])
@@ -2431,6 +2505,13 @@ def api_category_rename():
         parts = old_path.split("/")
         parent = "/".join(parts[:-1])
         new_path = f"{parent}/{new_name}" if parent else new_name
+        if new_path == old_path:
+            return jsonify({"ok": True, "new_path": new_path})
+
+        # Renaming onto a category that already exists would silently pour
+        # two categories into one - refuse instead of guessing.
+        if new_path in all_category_paths()[0]:
+            return jsonify({"error": f"A category called '{new_name}' already exists here."}), 400
 
         # update categories
         cat_map = read_categories()
@@ -2577,6 +2658,10 @@ def api_update_restart():
         import time
         time.sleep(1.0)                      # let this response reach the browser
         try:
+            # tells the new process to wait for this one's port to come free
+            # rather than mistake it for a copy that is already running
+            os.environ["INVENTORY_RESTARTED"] = "1"
+            os.environ.pop("WERKZEUG_SERVER_FD", None)
             os.execv(sys.executable, [sys.executable] + sys.argv)
         except Exception:
             os._exit(1)
@@ -2595,6 +2680,7 @@ def api_import_file():
         return jsonify({"cancelled": True})
     with LOCK:
         try:
+            ensure_files()
             import import_data  # imported lazily: import_data imports this module
             r = import_data.import_file(
                 path, quiet=True,
@@ -2626,6 +2712,7 @@ def api_import_folder():
     preview = bool(data.get("preview"))
     with LOCK:
         try:
+            ensure_files()
             import import_data
             r = import_data.import_folder(
                 path,
@@ -3356,13 +3443,38 @@ function startCellEdit(host){
     if(e.key==="Tab"){                     // walk along the row like a spreadsheet
       e.preventDefault();
       const hosts=editableHosts(), i=hosts.indexOf(host);
-      if(!await save()) return;
       const next=hosts[i + (e.shiftKey ? -1 : 1)];
-      if(next) startCellEdit(next);
+      const saving=save();                 // the request is on its way...
+      if(next) startCellEdit(next);        // ...and typing can carry straight on
+      await saving;
     }
   };
   el.onblur=()=>save();
+  el._save=save;
+  el._payload=()=>(settled||el.value===old) ? null : {id, fields:{[col]:el.value}};
 }
+
+// Save whatever is being typed into a cell before anything redraws the table,
+// so a refresh can never throw away an edit that is still in progress.
+function commitOpenCellEdit(){
+  const el=document.querySelector("#tableWrap .cell-edit");
+  if(el && el._save) el._save();
+}
+
+function userIsTyping(){
+  const a=document.activeElement;
+  return !!(document.querySelector("#tableWrap .cell-edit")
+            || (a && a.classList && a.classList.contains("qf")));
+}
+
+// Closing the window or tab mid-edit still saves the cell.
+window.addEventListener("pagehide", ()=>{
+  const el=document.querySelector("#tableWrap .cell-edit");
+  const p=el && el._payload && el._payload();
+  if(p && navigator.sendBeacon){
+    navigator.sendBeacon("/api/item", new Blob([JSON.stringify(p)], {type:"application/json"}));
+  }
+});
 
 // ---------- quick add: type a row, press Enter, repeat ----------
 // Values with the pin on stay for the next row, so shared details like a
@@ -3766,6 +3878,7 @@ function debouncedLoad(){clearTimeout(SEARCH_TIMER);SEARCH_TIMER=setTimeout(load
 async function loadItems(){
   const cat=SELECTED, sub=$("#includeSub").checked?"1":"0";
   const search=encodeURIComponent($("#search").value.trim());
+  commitOpenCellEdit();
   const crumb = cat ? cat.split("/").map(esc).join(" › ") : "All items";
   $("#crumb").innerHTML = `<span class="crumb">${crumb}</span>`;
   const data = await api(`/api/items?category=${encodeURIComponent(cat)}&include_sub=${sub}&search=${search}`);
@@ -3809,6 +3922,7 @@ function openCategory(path){
 }
 
 function renderTable(items, customFields){
+  commitOpenCellEdit();
   const wrap=$("#tableWrap");
   const subs=subcategoriesHtml();
   if(!items.length){
@@ -4794,6 +4908,7 @@ async function changeIdentity(){
 let DATA_VERSION=null, RELOAD_HINT=false;
 async function checkForOthers(){
   if($("#overlay").classList.contains("show")) return;   // don't nag mid-edit
+  if(userIsTyping()) return;           // a redraw now would lose what is typed
   try{
     const r=await api("/api/ping");
     if(DATA_VERSION===null){ DATA_VERSION=r.version; return; }
@@ -4950,6 +5065,34 @@ def _open_browser(url):
     threading.Timer(1.2, lambda: webbrowser.open(url)).start()
 
 
+def _already_running(url):
+    """
+    If this app is already serving on the port, reuse it instead of failing
+    with "address in use". A copy left running from before an update would
+    keep showing the old version, so it is asked to restart into this code.
+    Returns True when the browser has been pointed at a running copy.
+    """
+    # straight to this machine: a company proxy must not answer for it
+    local = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with local.open(url + "/api/ping", timeout=2) as r:
+            info = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return False
+    if not isinstance(info, dict) or "version" not in info:
+        return False                          # something else owns the port
+    if info.get("app_version") != APP_VERSION:
+        try:
+            req = urllib.request.Request(url + "/api/update/restart", data=b"{}",
+                                         headers={"Content-Type": "application/json"})
+            local.open(req, timeout=3).read()
+            time.sleep(3)
+        except Exception:
+            pass
+    webbrowser.open(url)
+    return True
+
+
 if __name__ == "__main__":
     # A missing data folder must not stop the app from starting: it needs to
     # come up so the browser can explain the problem and offer to fix it.
@@ -4972,11 +5115,47 @@ if __name__ == "__main__":
     print("  (Press Ctrl+C to stop)")
     print("=" * 60)
 
-    # Flask's dev server would spawn a second process with the reloader and
-    # open the browser twice; the reloader is already off (debug=False).
-    _open_browser(url)
+    restarted = os.environ.pop("INVENTORY_RESTARTED", "") == "1"
+    # Versions up to 1.15.0 restarted themselves with Flask's runner, which
+    # hands the new process its listening socket. Take it over, so the first
+    # restart after updating from one of those versions comes back up too.
+    inherited_fd = os.environ.pop("WERKZEUG_SERVER_FD", None)
+    if inherited_fd:
+        restarted = True
+    if not restarted and _already_running(url):
+        sys.exit(0)
+
+    threading.Thread(target=_backup_catch_up, daemon=True).start()
+
+    if not restarted:                  # the open page reconnects by itself
+        _open_browser(url)
+    # make_server rather than APP.run: APP.run marks its socket as inherited
+    # by child processes (for Flask's reloader), so after a restart the new
+    # process was born still holding the very port it then failed to open.
+    from werkzeug.serving import make_server
+    server, error = None, None
+    if inherited_fd:
+        try:
+            server = make_server(HOST, PORT, APP, threaded=True,
+                                 fd=int(inherited_fd))
+            # the server works on its own copy; the inherited original would
+            # otherwise be handed down again and block the next restart
+            os.close(int(inherited_fd))
+        except Exception as e:
+            error = e
+    for attempt in range(0 if server else (40 if restarted else 1)):
+        try:
+            server = make_server(HOST, PORT, APP, threaded=True)
+            break
+        except OSError as e:          # Windows: the old process is still exiting
+            error = e
+            time.sleep(0.25)
     try:
-        APP.run(host=HOST, port=PORT, debug=False)
+        if server is None:
+            raise error
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     except OSError as e:
         fatal(
             f"Could not start on {url}: {e}\n\n"

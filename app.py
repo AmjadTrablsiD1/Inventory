@@ -205,7 +205,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -1852,7 +1852,13 @@ def api_item_save():
         category = (fields.get("category_path") or "").strip()
         name = (fields.get("name") or "").strip()
 
-        if not name:
+        # An existing item may be updated one field at a time (editing a cell
+        # in the table), so a name is only required when it is actually being
+        # set - demanding it here made every single-field edit fail.
+        if item_id:
+            if "name" in fields and not name:
+                return jsonify({"error": "The name cannot be empty."}), 400
+        elif not name:
             return jsonify({"error": "Name is required."}), 400
 
         # discover any new custom columns
@@ -2763,6 +2769,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
     margin:14px;padding:14px 16px;border-radius:10px;font-size:13px;
     background:var(--accent-soft);border:1px solid var(--danger);
   }
+  .editable{cursor:text;}
+  tbody td.editable:hover{box-shadow:inset 0 0 0 1px var(--line);}
+  .nm.editable:hover{text-decoration:underline dotted;text-underline-offset:3px;}
+  .cell-edit{
+    width:100%;box-sizing:border-box;background:var(--bg);color:var(--text);
+    border:1px solid var(--accent);border-radius:5px;padding:4px 6px;
+    font-family:inherit;font-size:13px;
+  }
   .quick-add{margin:10px 14px;padding:10px 12px;border-radius:9px;
              background:var(--panel-2);border:1px solid var(--accent);}
   .quick-head{display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:8px;flex-wrap:wrap;}
@@ -3141,6 +3155,69 @@ function toggleFillRows(){
   FILL_ROWS = $("#fillRows").checked;
   try{ localStorage.setItem("inv_fill_rows", FILL_ROWS?"1":"0"); }catch(e){}
   loadItems();
+}
+
+// ---------- editing a cell in place ----------
+// Anything the app does not own can be typed straight into the table. The
+// columns it maintains itself stay read-only, and category/status have their
+// own commands because they do more than set a value.
+const CELL_READONLY = ["category_path","status","date_added","last_modified",
+                       "modified_by","color","used_date"];
+function CELL_EDITABLE(col){ return !CELL_READONLY.includes(col); }
+
+function editableHosts(){
+  return [...document.querySelectorAll('#tableWrap [data-edit="1"]')];
+}
+
+function startCellEdit(host){
+  if(!host || host.querySelector("input,textarea")) return;
+  const id=host.dataset.id, col=host.dataset.col;
+  const item=(LAST_ITEMS||[]).find(x=>x.id===id);
+  if(!item) return;
+  const before=host.innerHTML, old=String(item[col]||"");
+  const multi = /\n/.test(old) || old.length>60;
+  const el=document.createElement(multi?"textarea":"input");
+  el.className="cell-edit"; el.value=old; if(multi) el.rows=3;
+  host.innerHTML=""; host.appendChild(el);
+  el.focus(); if(el.select) el.select();
+
+  let settled=false;
+  const restore=txt=>{ host.innerHTML = txt===undefined ? before : esc(txt); };
+  const cancel=()=>{ if(settled)return; settled=true; restore(); };
+  const save=async()=>{
+    if(settled) return true;
+    settled=true;
+    const val=el.value;
+    if(val===old){ restore(); return true; }
+    try{
+      await api("/api/item",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({id, fields:{[col]:val}})});
+      item[col]=val;                      // keep the on-screen copy in step
+      restore(val);
+      host.closest("td")?.setAttribute("title", val);
+      toast("Saved");
+      return true;
+    }catch(e){
+      toast(e.error||"Could not save","err");
+      restore();
+      return false;
+    }
+  };
+
+  el.onkeydown=async e=>{
+    if(e.key==="Escape"){ e.preventDefault(); cancel(); return; }
+    if(e.key==="Enter" && (!multi || e.metaKey || e.ctrlKey)){
+      e.preventDefault(); await save(); return;
+    }
+    if(e.key==="Tab"){                     // walk along the row like a spreadsheet
+      e.preventDefault();
+      const hosts=editableHosts(), i=hosts.indexOf(host);
+      if(!await save()) return;
+      const next=hosts[i + (e.shiftKey ? -1 : 1)];
+      if(next) startCellEdit(next);
+    }
+  };
+  el.onblur=()=>save();
 }
 
 // ---------- quick add: type a row, press Enter, repeat ----------
@@ -3661,11 +3738,15 @@ function renderTable(items, customFields){
     html+=`<td class="col-name" style="${wstyle("name")}" title="${esc(it.name||"")}">`
         + `<div class="nmwrap">`
         + `<label class="pickwrap"><input type="checkbox" class="rowpick" data-id="${esc(it.id)}" ${picked?"checked":""}></label>`
-        + `${dot}<span class="nm">${esc(it.name||"")}</span></div></td>`;
+        + `${dot}<span class="nm editable" data-edit="1" data-id="${esc(it.id)}" data-col="name"`
+        + ` title="Click to edit">${esc(it.name||"")}</span></div></td>`;
     dataCols.forEach(c=>{
       let v=it[c]||"";
       if(c==="status") v = used?"Used":"In stock";
-      html+=`<td style="${wstyle(c)}" title="${esc(v)}">${esc(v)}</td>`;
+      const edit = CELL_EDITABLE(c);
+      html+=`<td style="${wstyle(c)}" class="${edit?"editable":""}"`
+          + (edit?` data-edit="1" data-id="${esc(it.id)}" data-col="${esc(c)}"`:"")
+          + ` title="${esc(v)}${edit?" — click to edit":""}">${esc(v)}</td>`;
     });
     html+=`<td class="col-act" style="white-space:nowrap">
            <button class="icon-btn" title="Add to order list" data-act="order" data-id="${esc(it.id)}">🛒</button>
@@ -3691,10 +3772,12 @@ function renderTable(items, customFields){
   wrap.querySelectorAll("tbody tr").forEach(tr=>{
     const id=tr.dataset.id;
     tr.onclick=e=>{
-      if(e.target.closest("button") || e.target.closest("input")) return;
+      if(e.target.closest("button") || e.target.closest("input,textarea")) return;
       if(e.shiftKey){ selectRange(id); return; }
       if(e.metaKey||e.ctrlKey){ toggleSelect(id); return; }
-      editItem(id);
+      const host=e.target.closest('[data-edit="1"]');
+      if(host){ startCellEdit(host); return; }     // edit right here
+      editItem(id);                                 // a read-only cell: full form
     };
     tr.oncontextmenu=e=>{
       e.preventDefault();
@@ -3968,7 +4051,10 @@ async function buildItemModal(item){
   const opts = await categoryOptions(startCat);
   let customPairs=[];   // {key,value}
   if(item){
-    STATE.custom_fields.forEach(f=>{ if((item[f]||"").trim()!=="") customPairs.push({key:f,value:item[f]}); });
+    // Every field that exists is shown, empty ones included. Hiding the empty
+    // ones made them look as though they did not exist, so filling one in
+    // meant adding the field again by hand.
+    STATE.custom_fields.forEach(f=>customPairs.push({key:f, value:item[f]||""}));
   }
 
   const body=`

@@ -25,6 +25,7 @@ Most inventory tools force a fixed set of fields on you. This one doesn't:
 | **Dynamic category tree** | Unlimited nesting, browsable from the tree or the main panel |
 | **Dynamic item fields** | Add fields per item, typed as Text / Number / Date / Notes |
 | **Quick add** | Type row after row, keeping the values you pin — no dialog per item |
+| **Edit in the table** | Click a cell and type; Tab moves along the row |
 | **Required-field templates** | Per category, inherited by subcategories |
 | **Auto-save** | Every change written to CSV immediately |
 | **Change history** | Timestamped log of every add, edit, move and delete |
@@ -270,6 +271,16 @@ Always try `--dry-run` first on a file you care about — it prints the full map
 **Right-click** any row for the same actions as a context menu. Right-clicking inside a selection acts on the whole selection; right-clicking outside it selects that one row first. The **⋯** button on each row opens the same menu if you prefer clicking.
 
 **Nothing runs away from you.** The checkbox and item name are pinned to the left of the table and the action buttons are pinned to the right, so no matter how many custom columns you have or how far you scroll sideways, you can always see which row you are about to act on.
+
+---
+
+## Editing in the table
+
+Click any cell and type — no window opens. **Enter** saves, **Escape** throws the change away, and **Tab** saves and moves to the next cell along the row (**Shift+Tab** goes back), so a row can be filled in without touching the mouse. Clicking away saves as well.
+
+The columns the app maintains itself — category, status, the dates and who changed the item — stay read-only, because they are set by the commands that do the rest of the work (**Move to…**, **Mark as used**). Clicking one of those opens the full item window.
+
+The item window now lists **every field that exists**, including the ones that are empty for that item, so filling one in is just typing in the box rather than adding the field all over again.
 
 ---
 

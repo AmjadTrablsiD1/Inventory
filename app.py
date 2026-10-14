@@ -213,7 +213,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.17.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -531,7 +531,9 @@ def order_path():
 
 def read_col_settings():
     f = get_data_dir() / COLUMNS_JSON
-    out = {"labels": {}, "hidden": [], "order": [], "widths": {}}
+    # hidden: hidden everywhere; hidden_in: {view: [columns]} hidden in one
+    # view only ("" = All items, "Cat" = one category, "Cat/*" = with subs)
+    out = {"labels": {}, "hidden": [], "order": [], "widths": {}, "hidden_in": {}}
     if f.exists():
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
@@ -580,6 +582,7 @@ def rename_custom_field(old, new):
 
     s = read_col_settings()
     s["hidden"] = [new if c == old else c for c in s["hidden"]]
+    s["hidden_in"] = {k: [new if c == old else c for c in v] for k, v in s["hidden_in"].items()}
     s["order"] = [new if c == old else c for c in s["order"]]
     if old in s["labels"]:
         s["labels"][new] = s["labels"].pop(old)
@@ -612,6 +615,7 @@ def delete_custom_field(name):
 
     s = read_col_settings()
     s["hidden"] = [c for c in s["hidden"] if c != name]
+    s["hidden_in"] = {k: [c for c in v if c != name] for k, v in s["hidden_in"].items()}
     s["order"] = [c for c in s["order"] if c != name]
     s["labels"].pop(name, None)
     write_col_settings(s)
@@ -2169,11 +2173,14 @@ def api_state():
         ensure_files()
         rows, custom = read_inventory()
         tree = build_tree()
+        # how many items hold something in each custom column, inventory-wide
+        column_fill = {c: sum(1 for r in rows if str(r.get(c, "")).strip()) for c in custom}
         d = str(get_data_dir())
         return jsonify(
             {
                 "tree": tree,
                 "custom_fields": custom,
+                "column_fill": column_fill,
                 "base_columns": BASE_COLUMNS,
                 "data_dir": d,
                 "item_count": len(rows),
@@ -2496,6 +2503,34 @@ def api_columns():
             ok, err = delete_custom_field((data.get("name") or "").strip())
             return (jsonify({"ok": True}) if ok else (jsonify({"error": err}), 400))
 
+        if action == "purge_empty":
+            # Only columns that hold nothing for ANY item - checked here, on the
+            # file as it is now, not on what the browser last saw - so no value
+            # can be lost even if someone filled one in a moment ago.
+            rows, custom = read_inventory()
+            empty = [c for c in custom
+                     if not any(str(r.get(c, "")).strip() for r in rows)]
+            if not empty:
+                return jsonify({"ok": True, "removed": []})
+            backup_now("before-column-cleanup")
+            keep = [c for c in custom if c not in empty]
+            write_inventory(rows, keep)
+            cat_map = read_categories()
+            if any(set(v) & set(empty) for v in cat_map.values()):
+                write_categories({k: [x for x in v if x not in empty]
+                                  for k, v in cat_map.items()})
+            s = read_col_settings()
+            s["hidden"] = [c for c in s["hidden"] if c not in empty]
+            s["hidden_in"] = {k: [c for c in v if c not in empty]
+                              for k, v in s["hidden_in"].items()}
+            s["order"] = [c for c in s["order"] if c not in empty]
+            for c in empty:
+                s["labels"].pop(c, None)
+                s["widths"].pop(c, None)
+            write_col_settings(s)
+            log_history("remove_empty_columns", f"{len(empty)} column(s)", ", ".join(empty))
+            return jsonify({"ok": True, "removed": empty})
+
         if action in ("order", "hidden", "settings"):
             s = read_col_settings()
             if isinstance(data.get("order"), list):
@@ -2504,6 +2539,10 @@ def api_columns():
                 s["hidden"] = [str(c) for c in data["hidden"] if c != "name"]
             if isinstance(data.get("labels"), dict):
                 s["labels"] = {str(k): str(v) for k, v in data["labels"].items() if v}
+            if isinstance(data.get("hidden_in"), dict):
+                s["hidden_in"] = {str(k): [str(c) for c in v if c != "name"]
+                                  for k, v in data["hidden_in"].items()
+                                  if isinstance(v, list) and v}
             if isinstance(data.get("widths"), dict):
                 s["widths"] = {str(k): max(60, min(620, int(v)))
                                for k, v in data["widths"].items()
@@ -2782,6 +2821,17 @@ def api_category_rename():
                 r["category_path"] = new_path + p[len(old_path):]
                 touch(r)
         write_inventory(rows, custom)
+
+        # columns hidden in that category's views follow it to its new name
+        s = read_col_settings()
+        if s["hidden_in"]:
+            def moved(k):
+                base, star = (k[:-2], "/*") if k.endswith("/*") else (k, "")
+                if base == old_path or base.startswith(old_path + "/"):
+                    return new_path + base[len(old_path):] + star
+                return k
+            s["hidden_in"] = {moved(k): v for k, v in s["hidden_in"].items()}
+            write_col_settings(s)
         log_history("rename_category", old_path, f"-> {new_path}")
         return jsonify({"ok": True, "new_path": new_path})
 
@@ -3335,6 +3385,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   .field{margin-bottom:14px;}
   .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;}
+  .tag{font-size:11px;padding:1px 6px;border-radius:999px;border:1px solid var(--line);color:var(--muted);margin-left:4px}
+  #colBtn{white-space:nowrap}
+  .col-quick{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:10px 0}
+  .col-row{grid-template-columns:26px 1fr auto auto;align-items:center}
+  .col-row.is-off .col-name-cell{opacity:.5;text-decoration:line-through}
+  .col-fill{font-size:12px;white-space:nowrap}
+  .more-fields{margin:4px 0 12px}
   .field label.opt{display:flex;align-items:flex-start;gap:10px;margin:0 0 8px;padding:10px 12px;
     border:1px solid var(--line);border-radius:var(--radius);cursor:pointer;font-size:12.5px;line-height:1.45}
   .field label.opt input{margin:2px 0 0;flex:none;width:auto;padding:0}
@@ -3408,7 +3465,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <label class="check"><input type="checkbox" id="fillRows" onchange="toggleFillRows()"> fill whole row with colour</label>
         <label class="check"><input type="checkbox" id="wrapText" onchange="toggleWrap()"> wrap long text</label>
         <button class="btn small ghost" id="quickBtn" onclick="toggleQuickAdd()" title="Add rows one after another, keeping the values you pin">Quick add</button>
-        <button class="btn small ghost" onclick="openColumnsModal()" title="Rename, reorder, hide or delete columns">Columns</button>
+        <button class="btn small ghost" id="colBtn" onclick="openColumnsModal()" title="Rename, reorder, hide or delete columns">Columns</button>
         <input class="search" id="search" placeholder="Search…" oninput="debouncedLoad()">
       </div>
       <div class="sel-bar" id="selBar" style="display:none">
@@ -3972,15 +4029,60 @@ async function resetColWidth(col){
 }
 
 async function unhideAll(){
-  await saveColSettings({hidden:[]});
-  toast("All hidden columns are showing again");
+  await showColumns(effectiveHidden());
 }
 
-async function hideColumn(col){
-  const hidden=[...((STATE.columns||{}).hidden||[])];
-  if(!hidden.includes(col)) hidden.push(col);
-  await saveColSettings({hidden});
-  toast(`"${COL_LABEL(col)}" hidden`);
+// Columns this person hid on purpose. The "hidden columns have data" note is
+// for surprises - a name hidden long ago that a new import fills again - not
+// for a column someone hid a second ago, so those are remembered here.
+function hiddenAck(){
+  try{ return new Set(JSON.parse(localStorage.getItem("inv_hidden_ack")||"[]")); }
+  catch(e){ return new Set(); }
+}
+function ackHidden(cols){
+  const s=hiddenAck(); cols.forEach(c=>s.add(c));
+  try{ localStorage.setItem("inv_hidden_ack", JSON.stringify([...s])); }catch(e){}
+}
+
+// Each view - All items, one category, a category with its subcategories -
+// can hide its own columns: a column that is mostly empty across everything
+// is often the most important one inside its own category.
+function viewKey(){
+  return SELECTED + (SELECTED && $("#includeSub") && $("#includeSub").checked ? "/*" : "");
+}
+function viewName(key){
+  if(key===undefined) key=viewKey();
+  if(!key) return "All items";
+  return key.endsWith("/*") ? `${key.slice(0,-2)} (with subcategories)` : key;
+}
+function hiddenHere(key){
+  if(key===undefined) key=viewKey();
+  return ((STATE.columns||{}).hidden_in||{})[key]||[];
+}
+function effectiveHidden(key){
+  return [...new Set([...((STATE.columns||{}).hidden||[]), ...hiddenHere(key)])];
+}
+async function saveHidden(glob, here, key){
+  if(key===undefined) key=viewKey();
+  const hidden_in={...((STATE.columns||{}).hidden_in||{})};
+  hidden_in[key]=[...here];
+  await saveColSettings({hidden:[...glob], hidden_in});
+}
+
+async function hideColumn(col, everywhere){
+  ackHidden([col]);
+  const glob=new Set((STATE.columns||{}).hidden||[]), here=new Set(hiddenHere());
+  (everywhere ? glob : here).add(col);
+  await saveHidden(glob, here);
+  toast(everywhere ? `"${COL_LABEL(col)}" hidden everywhere`
+                   : `"${COL_LABEL(col)}" hidden in ${viewName()}`);
+}
+
+async function showColumns(cols){
+  const glob=new Set((STATE.columns||{}).hidden||[]), here=new Set(hiddenHere());
+  cols.forEach(c=>{ glob.delete(c); here.delete(c); });
+  await saveHidden(glob, here);
+  toast("Showing them again");
 }
 
 async function renameColumn(col){
@@ -4001,7 +4103,7 @@ async function renameColumn(col){
 async function deleteColumn(col){
   if(!isCustomCol(col)){
     toast("Built-in columns can't be deleted — hiding it instead","err");
-    return hideColumn(col);
+    return hideColumn(col, true);
   }
   const filled=(LAST_ITEMS||[]).filter(i=>String(i[col]||"").trim()).length;
   const go=await askConfirm({
@@ -4027,7 +4129,8 @@ function openColMenu(x,y,col,cols){
     ["◀ Move left",      ()=>moveColumn(col,-1),       i>0],
     ["▶ Move right",     ()=>moveColumn(col,+1),       i>=0 && i<order.length-1],
     ["↔ Reset width",    ()=>resetColWidth(col),       !!((STATE.columns||{}).widths||{})[col]],
-    ["🚫 Hide column",   ()=>hideColumn(col),          col!=="name"],
+    [`🚫 Hide in ${viewName()}`, ()=>hideColumn(col, false), col!=="name"],
+    ["🚫 Hide everywhere", ()=>hideColumn(col, true),    col!=="name"],
     ["🗑 Delete column…",()=>deleteColumn(col),        isCustomCol(col)],
     ["↩ Reset all widths",()=>saveColSettings({widths:{}}).then(()=>toast("Column widths reset")),
                             Object.keys((STATE.columns||{}).widths||{}).length>0],
@@ -4050,43 +4153,107 @@ function openColMenu(x,y,col,cols){
 
 async function openColumnsModal(){
   const CS=STATE.columns||{labels:{},hidden:[],order:[]};
-  const hidden=CS.hidden||[];
-  const known=[...LAST_COLS, ...ALL_COLUMNS.filter(c=>!LAST_COLS.includes(c))]
+  const key=viewKey();
+  const savedGlob=new Set(CS.hidden||[]), savedHere=new Set(hiddenHere(key));
+  const glob=new Set(savedGlob), here=new Set(savedHere);   // edited here, saved on Apply
+  let scope="here";
+  const isHidden=c=>glob.has(c)||here.has(c);
+  const hide=c=>(scope==="here"?here:glob).add(c);
+  const show=c=>{ glob.delete(c); here.delete(c); };
+  const view=LAST_ITEMS||[], fill=STATE.column_fill||{};
+  const builtins=["quantity","category_path","status","used_note","date_added","last_modified"];
+  const known=[...LAST_COLS, ...ALL_COLUMNS, ...builtins, ...(STATE.custom_fields||[])]
                 .filter((c,i,a)=>a.indexOf(c)===i);
-  const body=`<p class="muted">Drag-free ordering: use the arrows. Unticking hides a column
-    from the table without touching the data.</p>
+  const filled=c=>view.filter(i=>String(i[c]||"").trim()).length;
+  const emptyEverywhere=(STATE.custom_fields||[]).filter(c=>!(fill[c]>0));
+  const body=`<p class="muted">Untick a column to hide it from the table — the data stays.
+      Nothing changes until you press <b>Apply</b>.</p>
+    <div class="field" style="margin:10px 0 0"><label>Hide columns</label>
+      <label class="opt"><input type="radio" name="colScope" value="here" checked>
+        <span><b>Only in ${esc(viewName(key))}</b> — other categories keep their own columns</span></label>
+      <label class="opt"><input type="radio" name="colScope" value="all">
+        <span><b>Everywhere</b> — in every category and in All items</span></label></div>
+    <div class="col-quick">
+      <span class="muted">Quick:</span>
+      <button class="btn small" data-q="empty">Hide empty here</button>
+      <button class="btn small" data-q="half">Hide less than half filled here</button>
+      <button class="btn small" data-q="custom">Hide all imported columns</button>
+      <button class="btn small" data-q="none">Show all</button>
+    </div>
+    ${emptyEverywhere.length?`<div class="hidden-note" style="margin:10px 0">
+      <span>${emptyEverywhere.length} column(s) are empty for <b>every</b> item:
+        ${emptyEverywhere.map(c=>esc(COL_LABEL(c))).join(", ")}</span>
+      <button class="btn small" id="purgeEmpty">Remove them</button></div>`:""}
+    <div class="muted" style="margin:8px 0 4px;font-size:12px">Filled: in the ${view.length} row(s) on screen · in the whole inventory</div>
     <div id="colList"></div>`;
-  const m=modalShell("Columns", body, `<button class="btn primary" onclick="closeModal()">Done</button>`);
-  m.style.maxWidth="560px"; showModal(m);
+  const foot=`<span class="muted" id="colCount" style="margin-right:auto"></span>
+    <button class="btn ghost" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" id="colApply">Apply</button>`;
+  const m=modalShell("Columns", body, foot);
+  m.style.maxWidth="640px"; showModal(m);
 
+  const apply=async()=>{
+    ackHidden([...glob, ...here].filter(c=>!savedGlob.has(c) && !savedHere.has(c)));
+    await saveHidden(glob, here, key);
+  };
   const draw=()=>{
-    m.querySelector("#colList").innerHTML = known.map((c,i)=>`
-      <div class="upd-row" style="grid-template-columns:26px 1fr auto;align-items:center">
-        <input type="checkbox" class="colvis" data-c="${esc(c)}" ${hidden.includes(c)?"":"checked"}
+    m.querySelector("#colList").innerHTML = known.map(c=>{
+      const custom=isCustomCol(c) || (STATE.custom_fields||[]).includes(c);
+      const n=filled(c), total=custom ? (fill[c]||0) : null;
+      return `<div class="upd-row col-row ${isHidden(c)?"is-off":""}">
+        <input type="checkbox" class="colvis" data-c="${esc(c)}" ${isHidden(c)?"":"checked"}
                ${c==="name"?"disabled":""}>
-        <span>${esc(COL_LABEL(c))}${isCustomCol(c)?"":' <span class="muted">(built-in)</span>'}</span>
+        <span><span class="col-name-cell">${esc(COL_LABEL(c))}</span>${custom?"":' <span class="muted">(built-in)</span>'}${
+          glob.has(c)?' <span class="tag">hidden everywhere</span>':""}</span>
+        <span class="muted col-fill">${c==="name"?"":`${n}/${view.length}${total!==null?` · ${total}`:""}`}</span>
         <span style="white-space:nowrap">
-          <button class="icon-btn" data-mv="-1" data-c="${esc(c)}" ${c==="name"?"disabled":""}>◀</button>
-          <button class="icon-btn" data-mv="1"  data-c="${esc(c)}" ${c==="name"?"disabled":""}>▶</button>
+          <button class="icon-btn" data-mv="-1" data-c="${esc(c)}" ${c==="name"?"disabled":""} title="Move left">◀</button>
+          <button class="icon-btn" data-mv="1"  data-c="${esc(c)}" ${c==="name"?"disabled":""} title="Move right">▶</button>
           <button class="icon-btn" data-ren="${esc(c)}" title="Rename">✏️</button>
-          ${isCustomCol(c)?`<button class="icon-btn" data-del="${esc(c)}" title="Delete column">🗑</button>`:""}
-        </span></div>`).join("");
-    m.querySelectorAll(".colvis").forEach(cb=>cb.onchange=async()=>{
-      const c=cb.dataset.c;
-      const h=[...((STATE.columns||{}).hidden||[])].filter(x=>x!==c);
-      if(!cb.checked) h.push(c);
-      await saveColSettings({hidden:h});
-      closeModal(); openColumnsModal();
+          ${custom?`<button class="icon-btn" data-del="${esc(c)}" title="Delete column">🗑</button>`:""}
+        </span></div>`;
+    }).join("");
+    const diff=(a,b)=>[...a].filter(c=>!b.has(c)).length;
+    const changed=diff(glob,savedGlob)+diff(savedGlob,glob)+diff(here,savedHere)+diff(savedHere,here);
+    const n=known.filter(isHidden).length;
+    m.querySelector("#colCount").textContent=`${n} hidden here`+(changed?` · ${changed} change(s) not applied yet`:"");
+    m.querySelectorAll(".colvis").forEach(cb=>cb.onchange=()=>{
+      cb.checked ? show(cb.dataset.c) : hide(cb.dataset.c); draw();
     });
-    m.querySelectorAll("[data-mv]").forEach(b=>b.onclick=async()=>{
-      await moveColumn(b.dataset.c, +b.dataset.mv); closeModal(); openColumnsModal();
+    // the other buttons act at once, so apply pending ticks first
+    const thenReopen=fn=>async()=>{ await apply(); await fn(); closeModal(); openColumnsModal(); };
+    m.querySelectorAll("[data-mv]").forEach(b=>b.onclick=thenReopen(()=>moveColumn(b.dataset.c, +b.dataset.mv)));
+    m.querySelectorAll("[data-ren]").forEach(b=>b.onclick=thenReopen(()=>renameColumn(b.dataset.ren)));
+    m.querySelectorAll("[data-del]").forEach(b=>b.onclick=thenReopen(()=>deleteColumn(b.dataset.del)));
+  };
+  m.querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>{
+    const q=b.dataset.q;
+    known.filter(c=>c!=="name").forEach(c=>{
+      if(q==="none") show(c);
+      else if(q==="empty" && filled(c)===0) hide(c);
+      else if(q==="half" && filled(c) < view.length/2) hide(c);
+      else if(q==="custom" && (isCustomCol(c) || (STATE.custom_fields||[]).includes(c))) hide(c);
     });
-    m.querySelectorAll("[data-ren]").forEach(b=>b.onclick=async()=>{
-      await renameColumn(b.dataset.ren); closeModal(); openColumnsModal();
-    });
-    m.querySelectorAll("[data-del]").forEach(b=>b.onclick=async()=>{
-      await deleteColumn(b.dataset.del); closeModal(); openColumnsModal();
-    });
+    draw();
+  });
+  m.querySelectorAll('input[name="colScope"]').forEach(r=>r.onchange=()=>{ scope=r.value; });
+  const purge=m.querySelector("#purgeEmpty");
+  if(purge) purge.onclick=async()=>{
+    const go=await askConfirm({title:"Remove empty columns",
+      message:`Remove ${emptyEverywhere.length} column(s) that hold nothing for any item?<br><br>`
+             +`The app checks again just before removing, so a column someone has just filled in is kept.`,
+      okLabel:"Remove"});
+    if(!go) return;
+    try{
+      const r=await api("/api/columns",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({action:"purge_empty"})});
+      toast(`Removed ${r.removed.length} empty column(s)`);
+      await loadState(); closeModal(); openColumnsModal();
+    }catch(e){ toast(e.error||"Failed","err"); }
+  };
+  m.querySelector("#colApply").onclick=async()=>{
+    await apply();
+    toast(`${known.filter(isHidden).length} column(s) hidden in ${viewName(key)}`); closeModal();
   };
   draw();
 }
@@ -4198,12 +4365,15 @@ function renderTable(items, customFields){
 
   // column settings: saved order first, then anything new, minus hidden ones
   const CS = (STATE.columns||{labels:{},hidden:[],order:[]});
-  const ord=CS.order||[], hidden=CS.hidden||[];
+  const ord=CS.order||[], hidden=effectiveHidden();
   cols = [...ord.filter(c=>cols.includes(c)), ...cols.filter(c=>!ord.includes(c))];
   // a column hidden earlier stays hidden when a later import recreates the same
   // name, which looks exactly like "the import lost my data" - so say so plainly
+  const ack = hiddenAck();
   const hiddenWithData = hidden.filter(c =>
-        c!=="name" && items.some(it=>String(it[c]||"").trim()!==""));
+        c!=="name" && !ack.has(c) && items.some(it=>String(it[c]||"").trim()!==""));
+  const colBtn=$("#colBtn");
+  if(colBtn) colBtn.textContent = hidden.length ? `Columns · ${hidden.length} hidden` : "Columns";
   cols = cols.filter(c=>c==="name" || !hidden.includes(c));
   ALL_COLUMNS = [...new Set([...cols, ...usedCustom, "quantity","category_path",
                              "status","used_note","date_added","last_modified"])];
@@ -4268,15 +4438,19 @@ function renderTable(items, customFields){
     html+="</tr>";
   });
   html+="</tbody></table>";
-  html = subs + quickAddHtml(usedCustom) + html;
+  html = subs + quickAddHtml(usedCustom.filter(c=>!hidden.includes(c))) + html;
   if(hiddenWithData.length){
-    html = `<div class="hidden-note">${hiddenWithData.length} column(s) with data are hidden:
-      <b>${hiddenWithData.map(c=>esc(COL_LABEL(c))).join(", ")}</b>
-      <button class="btn small" onclick="unhideAll()">Show them</button>
-      <button class="btn small ghost" onclick="openColumnsModal()">Columns…</button></div>` + html;
+    html = `<div class="hidden-note"><span>${hiddenWithData.length} hidden column(s) have data here:
+      <b>${hiddenWithData.map(c=>esc(COL_LABEL(c))).join(", ")}</b></span>
+      <button class="btn small" id="showHidden">Show them</button>
+      <button class="btn small ghost" id="keepHidden" title="Keep them hidden and stop telling me">Keep hidden ✕</button></div>` + html;
   }
   wrap.innerHTML=html;
   wireQuickAdd(wrap);
+  const kh=wrap.querySelector("#keepHidden");
+  if(kh) kh.onclick=()=>{ ackHidden(hiddenWithData); loadItems(); };
+  const sh=wrap.querySelector("#showHidden");
+  if(sh) sh.onclick=()=>showColumns(hiddenWithData);
   if(WRAP_TEXT){ const t=wrap.querySelector("table"); if(t) t.classList.add("wrap"); }
 
   // ---- wiring ----
@@ -4555,20 +4729,31 @@ async function editItem(id){
   const data=await api(`/api/items?category=&include_sub=1`);
   const it=data.items.find(x=>x.id===id);
   if(!it){toast("Not found","err");return;}
-  await buildItemModal(it);
+  const siblings=data.items.filter(x=>(x.category_path||"")===(it.category_path||""));
+  await buildItemModal(it, siblings);
 }
 
-async function buildItemModal(item){
+async function buildItemModal(item, siblings){
   const isEdit=!!item;
   const startCat = item ? item.category_path : SELECTED;
   const opts = await categoryOptions(startCat);
-  let customPairs=[];   // {key,value}
+  let customPairs=[];   // {key,value,extra}
+  const cleared=new Set();
+  const hiddenCols=effectiveHidden(item ? (item.category_path||"") : viewKey());
   if(item){
-    // Every field that exists is shown, empty ones included. Hiding the empty
-    // ones made them look as though they did not exist, so filling one in
-    // meant adding the field again by hand.
-    STATE.custom_fields.forEach(f=>customPairs.push({key:f, value:item[f]||""}));
+    // Every field that exists can be filled in here - leaving the empty ones
+    // out made them look as though they did not exist. But an import can add
+    // dozens of columns that belong to other categories, so up front are the
+    // ones this item has, or that its category uses (unless hidden); the rest
+    // wait behind "more fields", one click away.
+    const used=f=>(siblings||[]).some(x=>String(x[f]||"").trim());
+    STATE.custom_fields.forEach(f=>{
+      const has=String(item[f]||"").trim()!=="";
+      customPairs.push({key:f, value:item[f]||"",
+                        extra: !has && (!used(f) || hiddenCols.includes(f))});
+    });
   }
+  let showExtra=false;
 
   const body=`
     <div class="field"><label>Name <span class="req">*</span></label>
@@ -4619,19 +4804,33 @@ async function buildItemModal(item){
 
   const renderCustom=()=>{
     const c=m.querySelector("#customFields");
+    const extras=customPairs.filter(p=>p.extra).length;
     c.innerHTML = customPairs.map((p,i)=>{
+      if(p.extra && !showExtra) return "";
       const val=p.value||"";
       const multiline = /\n/.test(val) || val.length>60;
       const control = multiline
         ? `<textarea data-i="${i}" class="cv" rows="3">${esc(val)}</textarea>`
         : `<input data-i="${i}" class="cv" value="${esc(val)}">`;
+      const note=hiddenCols.includes(p.key)?' <span class="muted">(hidden in the table)</span>':"";
       return `<div class="custom-row">
-        <div class="field" style="margin:0"><label>${esc(p.key)}</label>${control}</div>
-        <button class="btn danger small" data-del="${i}" title="Remove field">✕</button>
+        <div class="field" style="margin:0"><label>${esc(p.key)}${note}</label>${control}</div>
+        <button class="btn danger small" data-del="${i}" title="Clear this field for this item">✕</button>
       </div>`;
-    }).join("");
+    }).join("") + (extras ? `<div class="more-fields">
+        <button class="btn small ghost" id="toggleExtra" type="button">${showExtra
+          ? "Hide the fields this category does not use"
+          : `＋ ${extras} more field(s) — not used in this category`}</button></div>` : "");
     c.querySelectorAll(".cv").forEach(inp=>inp.oninput=()=>customPairs[+inp.dataset.i].value=inp.value);
-    c.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>{customPairs.splice(+b.dataset.del,1);renderCustom();});
+    // removing a field from the form must clear it - otherwise the old value
+    // simply stays on the item, because unsent fields are left as they are
+    c.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>{
+      const p=customPairs[+b.dataset.del];
+      if(item && STATE.custom_fields.includes(p.key)) cleared.add(p.key);
+      customPairs.splice(+b.dataset.del,1); renderCustom();
+    });
+    const t=c.querySelector("#toggleExtra");
+    if(t) t.onclick=()=>{ showExtra=!showExtra; renderCustom(); };
   };
   renderCustom();
 
@@ -4695,6 +4894,7 @@ async function buildItemModal(item){
         : ""
     };
     if(!fields.name){toast("Name is required","err");return;}
+    cleared.forEach(k=>{ fields[k]=""; });
     customPairs.forEach(p=>{ if(p.key.trim()) fields[p.key.trim()]=p.value; });
     try{
       await api("/api/item",{method:"POST",headers:{"Content-Type":"application/json"},

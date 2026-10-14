@@ -337,10 +337,25 @@ Imported spreadsheets often arrive with unhelpful headings like `333`, or column
 
 - **Rename** it — for a column that came from your data this really renames the field, in the CSV header and on every item, and updates any category that required it. For a built-in column such as *Category* or *Used for* only the heading you see changes; the underlying field keeps its name so nothing else breaks.
 - **Move left / Move right** to reorder.
-- **Hide** it — the column disappears from the table but the data stays in the file, so you can bring it back any time.
+- **Hide in this view** or **Hide everywhere** — the column disappears from the table but the data stays in the file, so you can bring it back any time.
 - **Delete** it — only offered for columns that came from your data. It removes that field from every item and from the CSV, and tells you how many items hold data in it first.
 
-The **Columns** dialog lists everything at once with tick boxes for visibility and arrows for order. Settings live in `column_settings.json` next to your data, so they travel with the folder rather than being stuck in one browser.
+The **Columns** dialog lists everything at once, with tick boxes for visibility and arrows for order. Next to each column it shows how many rows on screen use it, and how many items in the whole inventory do. Nothing changes until you press **Apply**, so you can untick many columns and apply them in one go. The quick buttons do common sets in one click:
+
+- **Hide empty here**
+- **Hide less than half filled here** — useful after importing sheets whose columns only belong to one category
+- **Hide all imported columns**
+- **Show all**
+
+**Hiding works per view.** A column that is nearly empty across *All items* is often the most important one inside its own category. So by default hiding applies only to the view you are in: *All items*, one category, or a category with its subcategories. Choose **Everywhere** in the dialog to hide it in every view. The toolbar button shows how many columns are hidden in the current view (`Columns · 11 hidden`).
+
+If a column that was hidden earlier gets data in the current view — typically because a new import filled a column with the same name — a note says so once. **Keep hidden ✕** closes it for good. Columns you hide yourself never trigger that note.
+
+When some columns are empty for **every** item (left over from imports or deletions), the dialog offers **Remove them**. It checks the file again at that moment, so a column someone has just filled in is kept, and it takes a backup snapshot first.
+
+**The edit window** shows the fields this item has, plus the ones its category uses. The many columns other categories brought in wait behind **＋ N more fields**, one click away. The **✕** next to a field clears it for that item; before this, removing a field from the window left the old value on the item.
+
+Settings live in `column_settings.json` next to your data, so they travel with the folder rather than being stuck in one browser.
 
 **Column widths.** Drag the right-hand edge of any heading to resize it. Widths are remembered with the rest of the column settings; **Reset width** (or **Reset all widths**) in the heading's right-click menu puts them back.
 

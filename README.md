@@ -374,14 +374,45 @@ By default the colour shows as a stripe down the left of the row. Tick **"fill w
 
 ## Exporting
 
-**Export** in the header writes a clean CSV: friendly column headings, no internal `id`, and `Status` rendered as "In stock"/"Used" rather than raw values. You choose:
+**Export** in the header writes clean CSV files that open in Excel with a double-click: friendly column headings (including any you renamed in the app), no internal `id`, and `Status` shown as "In stock"/"Used".
+
+### Folders, like the category tree (the default)
+
+Choose a folder; a new `Inventory export <date> <time>/` folder is created inside it, shaped exactly like your categories:
+
+```
+Inventory export 2026-10-14 1530/
+├── _Overview.csv              every category, its item counts and its file
+├── Cables.csv                 a category without subcategories
+├── Empty category.csv         headings only - nothing in the tree goes missing
+├── _Uncategorized.csv         items without a category, if there are any
+└── Electronics/               a category with subcategories becomes a folder
+    ├── Electronics.csv        ... holding the items of Electronics itself
+    ├── Resistors.csv
+    └── Sensors/
+        ├── Sensors.csv
+        └── Temperature.csv
+```
+
+Each file is a standalone table with only that category's own items and only the columns that hold something there, so a resistor list is not padded with every sensor column. If one of your own columns has the same name as one of the app's (a sheet that brought its own "Status", say), the app's column is called "Status (inventory)" so the two stay apart.
+
+Nothing is lost on the way back either: importing the export folder with **include subfolders** rebuilds the same categories, quantities, used/in-stock status, notes, colours, custom columns and original dates. `Electronics/Electronics.csv` goes back into *Electronics* itself rather than becoming *Electronics/Electronics*.
+
+### One file with everything
+
+The alternative layout: a single CSV with a **Category** column holding the full path, e.g. `Electronics/Sensors/Temperature`.
+
+### Excel and the separator
+
+Excel in Germany and most of Europe expects `;` between columns, because the comma is the decimal sign there; a comma-separated file opens squashed into column A. The export therefore uses the separator **Excel on that computer** expects. It reads the Windows regional setting, or the macOS region and number format. You can also pick semicolon or comma in the dialog, or set `INVENTORY_CSV_SEP`. Files are UTF-8 with a byte-order mark so umlauts and accents survive, and order-list prices are written as plain numbers (`12,50` or `12.50`) that Excel can add up. The readable snapshot in each backup uses the same separator.
+
+You can also choose:
 
 - everything, or just the selected category and its subcategories
-- whether to include the date columns
-- whether to include status / used-for columns
-- whether to include the colour column
+- whether to include the date columns, the status / used-for columns, and the colour column
+- whether to show the result in Finder / Explorer when done
 
-You pick where to save it with a normal Save dialog. This is the file to hand to someone else — unlike `inventory.csv`, it carries nothing the program needs internally.
+The save dialog opens before the app locks the shared data folder, so taking your time choosing a place never holds up anyone else's saves.
 
 ---
 
@@ -442,6 +473,7 @@ Everyone running the app sees the update on their next start.
 | `INVENTORY_REPO` | auto-detected | Update source, as `owner/name` |
 | `INVENTORY_BRANCH` | `main` | Branch the updater reads from |
 | `INVENTORY_CURRENCY` | `€` | Currency shown on order lists and exports |
+| `INVENTORY_CSV_SEP` | automatic | Column separator for exports: `;`, `,` or `tab`. Automatic follows what Excel on that computer expects |
 
 Your chosen data folder is remembered in `~/.inventory_manager_config.json`.
 

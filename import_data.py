@@ -46,7 +46,51 @@ COLOR_KEY = "__row_color__"
 # Column names we recognise as the item's name / quantity (case-insensitive).
 NAME_HINTS = ["name", "item", "item name", "title", "description", "product",
               "bezeichnung", "artikel", "gegenstand"]
-QTY_HINTS = ["quantity", "qty", "count", "amount", "stock", "menge", "anzahl"]
+QTY_HINTS = ["quantity", "qty", "count", "amount", "stock", "menge", "anzahl",
+             "stück", "stueck", "stk", "bestand"]
+
+
+def _app_labels():
+    """Headings renamed in the app (field -> heading). An export uses them, so
+    importing that export again must recognise them."""
+    try:
+        return {k: v for k, v in (inv.read_col_settings().get("labels") or {}).items() if v}
+    except Exception:
+        return {}
+
+
+def _hints(field, base):
+    label = _app_labels().get(field)
+    return ([label.lower().strip()] if label else []) + base
+
+
+# Columns an export writes for the app's own fields. Read back into those
+# fields - only when the value is one the app itself would have written - so an
+# exported folder re-imports as the same data instead of a set of new columns.
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$")
+
+
+def _own_field(heading, value):
+    """(field, value) when this column is one the app exported, else None."""
+    labels = dict(inv.EXPORT_LABELS)
+    labels.update(_app_labels())
+    h = heading.strip()
+    if h.lower().endswith(inv.OWN_COLUMN_SUFFIX.lower()):
+        h = h[:-len(inv.OWN_COLUMN_SUFFIX)]      # "Status (inventory)"
+    field = next((f for f, l in labels.items()
+                  if l.lower().strip() == h.lower().strip()), None)
+    v = value.strip()
+    if field == "status" and v.lower() in ("used", "in stock"):
+        return "status", ("used" if v.lower() == "used" else "")
+    if field == "color" and re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+        return "color", v.lower()
+    if field in ("used_date", "date_added") and _DATE_RE.match(v):
+        return field, v
+    if field == "used_note":
+        return "used_note", v
+    if field == "last_modified" and _DATE_RE.match(v):
+        return "last_modified", None          # re-stamped by the import itself
+    return None
 
 
 def _clean(v):
@@ -361,6 +405,11 @@ def row_to_item(row, name_col, qty_col):
             continue
         if key == name_col or key == qty_col:
             continue
+        own = _own_field(key, _clean(val))
+        if own:
+            if own[1] is not None:
+                fields[own[0]] = own[1]
+            continue
         fields[inv.sanitize_field_name(key)] = _clean(val)
 
     color = row.get(COLOR_KEY, "")
@@ -425,8 +474,8 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False,
         header = [k for k in (sheet_rows[0].keys() if sheet_rows else [])
                   if k != COLOR_KEY]
         # an explicit choice always wins over the guess
-        name_col = (name_col if name_col in header else None) or pick_column(header, NAME_HINTS)
-        qty_col = (qty_col if qty_col in header else None) or pick_column(header, QTY_HINTS)
+        name_col = (name_col if name_col in header else None) or pick_column(header, _hints("name", NAME_HINTS))
+        qty_col = (qty_col if qty_col in header else None) or pick_column(header, _hints("quantity", QTY_HINTS))
         colored = sum(1 for r in sheet_rows if r.get(COLOR_KEY))
 
         cat_map.setdefault(top, [])
@@ -446,7 +495,7 @@ def import_file(path, base_category=None, only_sheet=None, dry_run=False,
             item["name"] = name
             item["quantity"] = qty
             item["category_path"] = cat_path
-            item["date_added"] = ts
+            item["date_added"] = fields.get("date_added") or ts   # an export's own date survives
             item["last_modified"] = ts
             item["modified_by"] = inv.machine_identity()
             rows.append(item)
@@ -589,6 +638,11 @@ def import_folder(folder, under=None, recursive=False, dry_run=False,
             if str(rel) != ".":
                 sub = "/".join(p.replace("/", "-") for p in rel.parts)
                 parent = f"{under}/{sub}" if under else sub
+        # "Electronics/Electronics.csv" holds the items of Electronics itself
+        # (that is how a folder export lays out a category that also has
+        # subcategories), so it must not become Electronics/Electronics.
+        if parent and f.stem.strip().lower() == parent.split("/")[-1].strip().lower():
+            parent = "/".join(parent.split("/")[:-1]) or None
         try:
             r = import_file(f, parent=parent, dry_run=dry_run, quiet=True,
                             snapshot=False)

@@ -91,6 +91,7 @@ class SharedLock:
         self._rlock = threading.RLock()
         self._depth = 0
         self._path = None
+        self._mine = b""
         self.last_wait = 0.0
         self.last_broke_stale = False
 
@@ -99,7 +100,8 @@ class SharedLock:
 
     def _payload(self):
         return json.dumps({"who": machine_identity(), "pid": os.getpid(),
-                           "host": _host_name(), "at": now_str()})
+                           "host": _host_name(), "at": now_str(),
+                           "token": uuid.uuid4().hex})
 
     def _acquire_file(self):
         path = self._lock_path()
@@ -112,11 +114,12 @@ class SharedLock:
         while True:
             try:
                 fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                payload = self._payload().encode("utf-8")
                 try:
-                    os.write(fd, self._payload().encode("utf-8"))
+                    os.write(fd, payload)
                 finally:
                     os.close(fd)
-                self._path = path
+                self._path, self._mine = path, payload
                 self.last_wait = time.time() - started
                 return
             except FileExistsError:
@@ -151,7 +154,11 @@ class SharedLock:
     def _release_file(self):
         if self._path:
             try:
-                self._path.unlink()
+                # If we were slow enough for another computer to take the lock
+                # over, the file is theirs now - removing it would let a third
+                # one in on top of them.
+                if self._path.read_bytes() == self._mine:
+                    self._path.unlink()
             except Exception:
                 pass
         self._path = None
@@ -206,7 +213,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.15.1"
+APP_VERSION = "1.16.0"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
@@ -636,15 +643,15 @@ def native_picker_available():
     return shutil.which("zenity") is not None or shutil.which("kdialog") is not None
 
 
-def pick_directory_native():
+def pick_directory_native(prompt="Choose a folder for your inventory data"):
     """
     Open the OS folder chooser and return the selected path, or None if the
     user cancelled or no native dialog is available. Blocks until the user picks.
     """
+    prompt = prompt.replace('"', "'")
     try:
         if sys.platform == "darwin":
-            script = ('POSIX path of (choose folder with prompt '
-                      '"Choose a folder for your inventory data")')
+            script = f'POSIX path of (choose folder with prompt "{prompt}")'
             r = run_hidden(["osascript", "-e", script])
             return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
@@ -652,6 +659,7 @@ def pick_directory_native():
             ps = (
                 "Add-Type -AssemblyName System.Windows.Forms; "
                 "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                f"$f.Description = '{prompt.replace(chr(39), '')}'; "
                 "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }"
             )
             r = run_hidden(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
@@ -660,7 +668,7 @@ def pick_directory_native():
 
         # Linux
         for cmd in (["zenity", "--file-selection", "--directory",
-                     "--title=Choose a folder for your inventory data"],
+                     f"--title={prompt}"],
                     ["kdialog", "--getexistingdirectory", str(Path.home())]):
             if shutil.which(cmd[0]):
                 r = run_hidden(cmd)
@@ -1238,10 +1246,7 @@ def backup_now(reason="", quiet=True):
         # the readable copy: friendly headings, no internal ids
         header, rows = build_clean_export(include_dates=True, include_used=True,
                                           include_color=True)
-        with atomic_write(folder / f"{stamp}{tag}_inventory.csv") as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            w.writerows(rows)
+        write_excel_csv(folder / f"{stamp}{tag}_inventory.csv", header, rows)
 
         # exact copies, so a snapshot can also be restored as-is
         for src, name in ((inv, "inventory_full.csv"), (cats, "categories.csv"),
@@ -1421,30 +1426,30 @@ def build_tree():
     return to_list(root)
 
 
-def build_clean_export(category="", include_sub=True, include_dates=True,
-                       include_used=True, include_color=False):
+OWN_COLUMN_SUFFIX = " (inventory)"
+EXPORT_LABELS = {
+    "category_path": "Category", "name": "Name", "quantity": "Quantity",
+    "color": "Colour", "status": "Status", "used_note": "Used for",
+    "used_date": "Used on", "date_added": "Added", "last_modified": "Last modified",
+}
+
+
+def clean_table(selected, custom, include_dates=True, include_used=True,
+                include_color=False, include_category=True):
     """
-    Produce plain rows for export: real inventory data only, with friendly
-    column names and none of the program's internal bookkeeping (ids, etc).
+    Plain rows for a spreadsheet: real data only, friendly headings (the ones
+    chosen in the app, where renamed), and none of the program's bookkeeping.
+    Only custom columns that hold something in these rows are included, so a
+    category's file is not padded out with every other category's columns.
     Returns (header, rows).
     """
-    rows, custom = read_inventory()
-
-    selected = []
-    for r in rows:
-        p = (r.get("category_path") or "").strip()
-        if category:
-            if include_sub:
-                if not (p == category or p.startswith(category + "/")):
-                    continue
-            elif p != category:
-                continue
-        selected.append(r)
-
+    settings = read_col_settings()
+    order = [c for c in settings.get("order", []) if c in custom]
+    custom = order + [c for c in custom if c not in order]
     used_custom = [c for c in custom
                    if any(str(r.get(c, "")).strip() for r in selected)]
 
-    cols = ["category_path", "name", "quantity"] + used_custom
+    cols = (["category_path"] if include_category else []) + ["name", "quantity"] + used_custom
     if include_color:
         cols.append("color")
     if include_used:
@@ -1453,11 +1458,15 @@ def build_clean_export(category="", include_sub=True, include_dates=True,
         cols += ["date_added", "last_modified"]
     cols = [c for c in cols if c not in INTERNAL_COLUMNS]
 
-    labels = {
-        "category_path": "Category", "name": "Name", "quantity": "Quantity",
-        "color": "Colour", "status": "Status", "used_note": "Used for",
-        "used_date": "Used on", "date_added": "Added", "last_modified": "Last modified",
-    }
+    labels = dict(EXPORT_LABELS)
+    labels.update({k: v for k, v in (settings.get("labels") or {}).items() if v})
+    # An imported sheet may bring its own "Status" or "Notes" column. Two
+    # identical headings in one file cannot be told apart in Excel or on
+    # re-import, so the app's own column gets a suffix instead.
+    own_names = {c.lower().strip() for c in used_custom}
+    for c in cols:
+        if c not in custom and labels.get(c, c).lower().strip() in own_names:
+            labels[c] = f"{labels.get(c, c)}{OWN_COLUMN_SUFFIX}"
     header = [labels.get(c, c) for c in cols]
 
     out = []
@@ -1471,6 +1480,192 @@ def build_clean_export(category="", include_sub=True, include_dates=True,
             row.append(v)
         out.append(row)
     return header, out
+
+
+def build_clean_export(category="", include_sub=True, include_dates=True,
+                       include_used=True, include_color=False):
+    """Everything (or one category) as a single plain table. Returns (header, rows)."""
+    rows, custom = read_inventory()
+    selected = []
+    for r in rows:
+        p = (r.get("category_path") or "").strip()
+        if category:
+            if include_sub:
+                if not (p == category or p.startswith(category + "/")):
+                    continue
+            elif p != category:
+                continue
+        selected.append(r)
+    return clean_table(selected, custom, include_dates, include_used, include_color)
+
+
+# Places whose number format uses a decimal comma. Excel there expects ";"
+# between columns, and opens a comma-separated file squashed into column A.
+_DECIMAL_COMMA_REGIONS = {
+    "AD", "AL", "AO", "AR", "AT", "AZ", "BA", "BE", "BG", "BO", "BR", "BY", "CH",
+    "CL", "CM", "CO", "CR", "CU", "CY", "CZ", "DE", "DK", "DZ", "EC", "EE", "ES",
+    "FI", "FO", "FR", "GE", "GL", "GR", "HR", "HU", "ID", "IS", "IT", "KZ", "LB",
+    "LI", "LT", "LU", "LV", "MA", "MD", "ME", "MK", "MZ", "NL", "NO", "PE", "PL",
+    "PT", "PY", "RO", "RS", "RU", "SE", "SI", "SK", "SN", "TN", "TR", "UA", "UY",
+    "UZ", "VE", "VN", "ZA",
+}
+_SEP_CACHE = {}
+
+
+def excel_separator():
+    """
+    The column separator Excel on THIS computer opens correctly when a CSV is
+    double-clicked: ";" where numbers are written 1,5 (Germany and most of
+    Europe), "," elsewhere. INVENTORY_CSV_SEP overrides it.
+    """
+    env = os.environ.get("INVENTORY_CSV_SEP", "").strip().lower()
+    if env in (",", ";"):
+        return env
+    if env in ("tab", "\\t"):
+        return "\t"
+    if "sep" in _SEP_CACHE:
+        return _SEP_CACHE["sep"]
+    sep = ","
+    try:
+        if os.name == "nt":
+            import winreg              # what Excel itself reads
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Control Panel\International") as k:
+                lst = (winreg.QueryValueEx(k, "sList")[0] or "").strip()
+            if lst:
+                sep = lst[0]
+        elif sys.platform == "darwin":
+            loc = run_hidden(["defaults", "read", "-g", "AppleLocale"], timeout=5).stdout.strip()
+            region = re.split(r"[_-]", loc.split("@")[0])[-1].upper() if re.search(r"[_-]", loc) else ""
+            sep = ";" if region in _DECIMAL_COMMA_REGIONS else ","
+            # a decimal separator picked by hand in System Settings wins
+            sym = run_hidden(["defaults", "read", "-g", "AppleICUNumberSymbols"], timeout=5).stdout
+            m = re.search(r'\b0\s*=\s*"?([.,])"?\s*;', sym or "")
+            if m:
+                sep = ";" if m.group(1) == "," else ","
+        else:
+            import locale
+            locale.setlocale(locale.LC_NUMERIC, "")
+            sep = ";" if locale.localeconv().get("decimal_point") == "," else ","
+            locale.setlocale(locale.LC_NUMERIC, "C")
+    except Exception:
+        pass
+    if sep not in (",", ";", "\t"):
+        sep = ","
+    _SEP_CACHE["sep"] = sep
+    return sep
+
+
+def write_excel_csv(path, header, rows, sep=None):
+    """A CSV that Excel opens straight into columns, umlauts and all."""
+    with atomic_write(path) as f:          # utf-8 with BOM: Excel reads the encoding
+        w = csv.writer(f, delimiter=sep or excel_separator())
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def _unique_in(folder, name, taken):
+    """A name not yet used in this folder - compared without case, because
+    Windows and macOS treat 'Cables' and 'cables' as the same file."""
+    stem, ext = (name[:-4], ".csv") if name.lower().endswith(".csv") else (name, "")
+    candidate, n = name, 2
+    while candidate.lower() in taken or (folder / candidate).exists():
+        candidate = f"{stem} ({n}){ext}"
+        n += 1
+    taken.add(candidate.lower())
+    return folder / candidate
+
+
+def export_hierarchy(target_dir, category="", include_dates=True, include_used=True,
+                     include_color=False, sep=None):
+    """
+    Export as a folder tree shaped exactly like the category tree:
+
+        Inventory export 2026-10-14 1530/
+            _Overview.csv            every category, its file and its counts
+            Cables.csv               a category without subcategories
+            Electronics/             a category with subcategories ...
+                Electronics.csv      ... its own items (if it has any)
+                Resistors.csv
+                Sensors/ ...
+
+    Every file is a normal table that Excel opens on a double-click. Empty
+    categories still get a file (headings only) so no part of the structure
+    goes missing. Returns a summary dict.
+    """
+    sep = sep or excel_separator()
+    rows, custom = read_inventory()
+    tree = build_tree()
+    by_cat = {}
+    for r in rows:
+        by_cat.setdefault((r.get("category_path") or "").strip(), []).append(r)
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H%M")
+    target_dir = Path(target_dir)
+    if category:
+        node = None
+        stack = list(tree)
+        while stack:
+            n = stack.pop()
+            if n["path"] == category:
+                node = n
+                break
+            stack.extend(n["children"])
+        if node is None:
+            raise ValueError(f"There is no category '{category}'.")
+        top_nodes, root_name = None, f"{safe_filename(node['name'])} export {stamp}"
+    else:
+        node, top_nodes, root_name = None, tree, f"Inventory export {stamp}"
+
+    root = _unique_in(target_dir, root_name, set())
+    root.mkdir(parents=True)
+    taken = {}                    # folder -> names already used in it
+    overview, files = [], 0
+
+    def write(folder, filename, cat_path, items):
+        nonlocal files
+        path = _unique_in(folder, filename, taken.setdefault(folder, set()))
+        header, out = clean_table(items, custom, include_dates, include_used,
+                                  include_color, include_category=False)
+        write_excel_csv(path, header, out, sep)
+        files += 1
+        return path
+
+    def walk(n, folder, as_root=False):
+        own = by_cat.get(n["path"], [])
+        name = safe_filename(n["name"])
+        if n["children"] or as_root:
+            sub = folder if as_root else _unique_in(folder, name, taken.setdefault(folder, set()))
+            sub.mkdir(exist_ok=True)
+            path = write(sub, f"{name}.csv", n["path"], own) if (own or not n["children"]) else None
+            overview.append([n["path"], len(own), n["count"], len(n["children"]),
+                             str(path.relative_to(root)) if path else
+                             str(sub.relative_to(root)) + os.sep if sub != root else "(this folder)"])
+            for ch in n["children"]:
+                walk(ch, sub)
+        else:
+            path = write(folder, f"{name}.csv", n["path"], own)
+            overview.append([n["path"], len(own), n["count"], 0,
+                             str(path.relative_to(root))])
+
+    if node is not None:
+        walk(node, root, as_root=True)
+    else:
+        for n in top_nodes:
+            walk(n, root)
+        loose = by_cat.get("", [])
+        if loose:
+            path = write(root, f"{UNCATEGORIZED}.csv", "", loose)
+            overview.append(["(no category)", len(loose), len(loose), 0,
+                             str(path.relative_to(root))])
+
+    write_excel_csv(root / "_Overview.csv",
+                    ["Category", "Items in it", "Items incl. subcategories",
+                     "Subcategories", "File"], overview, sep)
+    count = sum(len(v) for k, v in by_cat.items()
+                if not category or k == category or k.startswith(category + "/"))
+    return {"folder": str(root), "files": files, "categories": len(overview),
+            "count": count, "separator": sep}
 
 
 # ----------------------------------------------------------------------------
@@ -1992,6 +2187,7 @@ def api_state():
                 "shared_config_exists": portable_config_file().exists(),
                 "data_status": status,
                 "backups": backup_summary(),
+                "csv_separator": excel_separator(),
                 "app_dir": str(APP_DIR),
                 "me": machine_identity(),
                 "updates_enabled": updates_enabled(),
@@ -2366,36 +2562,71 @@ def api_order_add():
         return jsonify({"ok": True, "count": len(rows), "total_display": money(total)})
 
 
+def excel_number(value, sep):
+    """A plain number Excel recognises: 1234,50 where the separator is ';'
+    (decimal-comma countries), 1234.50 elsewhere. No thousands separators."""
+    text = f"{float(value):.2f}"
+    return text.replace(".", ",") if sep == ";" else text
+
+
+def reveal_in_file_manager(path):
+    """Show a folder (or the folder holding a file) in Finder / Explorer."""
+    try:
+        p = Path(path)
+        if sys.platform == "darwin":
+            run_hidden(["open", "-R", str(p)] if p.is_file() else ["open", str(p)], timeout=10)
+        elif os.name == "nt":
+            if p.is_file():
+                subprocess.Popen(["explorer", "/select,", str(p)], creationflags=NO_WINDOW)
+            else:
+                os.startfile(str(p))
+        elif shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", str(p if p.is_dir() else p.parent)])
+    except Exception:
+        pass
+
+
+def _separator_choice(data):
+    s = str(data.get("separator") or "auto").strip().lower()
+    return {";": ";", "semicolon": ";", ",": ",", "comma": ","}.get(s) or excel_separator()
+
+
+# The save/folder dialogs below are opened BEFORE taking the shared lock:
+# someone may take a minute to choose a place, and every other computer's
+# saves would be stuck behind that dialog for the whole time.
+
 @APP.route("/api/order/export", methods=["POST"])
 def api_order_export():
     """Export the order list as a clean CSV or as a PDF."""
+    data = request.get_json(silent=True) or {}
+    fmt = (data.get("format") or "csv").lower()
+    if fmt not in ("csv", "pdf"):
+        return jsonify({"error": "Unknown format."}), 400
     with LOCK:
         ensure_files()
-        data = request.get_json(silent=True) or {}
-        fmt = (data.get("format") or "csv").lower()
-        if fmt not in ("csv", "pdf"):
-            return jsonify({"error": "Unknown format."}), 400
-
-        header, body, total = order_export_rows()
-        if not body:
+        if not order_export_rows()[1]:
             return jsonify({"error": "The order list is empty."}), 400
 
-        stamp = datetime.now().strftime("%Y-%m-%d")
-        default = f"order_list_{stamp}.{fmt}"
-        target = (data.get("path") or "").strip() or pick_save_file_native(default)
-        if not target:
-            return jsonify({"cancelled": True})
-        if not target.lower().endswith("." + fmt):
-            target += "." + fmt
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    target = (data.get("path") or "").strip() or pick_save_file_native(f"order_list_{stamp}.{fmt}")
+    if not target:
+        return jsonify({"cancelled": True})
+    if not target.lower().endswith("." + fmt):
+        target += "." + fmt
 
+    with LOCK:
+        ensure_files()
+        header, body, total = order_export_rows()
         try:
             if fmt == "csv":
-                with open(target, "w", newline="", encoding="utf-8-sig") as f:
-                    w = csv.writer(f)
-                    w.writerow(header)
-                    w.writerows(body)
-                    w.writerow([])
-                    w.writerow(["", "TOTAL", "", "", money(total), "", ""])
+                sep = _separator_choice(data)
+                rows, _ = read_order()
+                for line, r in zip(body, rows):          # numbers, not text
+                    line[3] = excel_number(parse_number(r.get("unit_price")), sep)
+                    line[4] = excel_number(r.get("line_total", 0) or 0, sep)
+                write_excel_csv(target, header,
+                                body + [[], ["", "TOTAL", "", "", excel_number(total, sep), "", ""]],
+                                sep)
                 count = len(body)
             else:
                 count, total = write_order_pdf(
@@ -2407,42 +2638,61 @@ def api_order_export():
 
         log_history("order_export", fmt.upper(),
                     f"{count} line(s), total {money(total)} -> {target}")
-        return jsonify({"ok": True, "path": target, "count": count,
-                        "total_display": money(total)})
+    if data.get("reveal"):
+        reveal_in_file_manager(target)
+    return jsonify({"ok": True, "path": target, "count": count,
+                    "total_display": money(total)})
 
 
 @APP.route("/api/export", methods=["POST"])
 def api_export():
-    """Write a clean CSV of the current data to a location the user picks."""
+    """
+    Export clean CSVs to a place the user picks: as a folder tree with one
+    file per category (layout "folders"), or as one file with everything.
+    """
+    data = request.get_json(silent=True) or {}
+    category = (data.get("category") or "").strip()
+    layout = "single" if data.get("layout") == "single" else "folders"
+    opts = dict(include_dates=bool(data.get("include_dates", True)),
+                include_used=bool(data.get("include_used", True)),
+                include_color=bool(data.get("include_color", False)))
+    sep = _separator_choice(data)
+
     with LOCK:
         ensure_files()
-        data = request.get_json(silent=True) or {}
-        category = (data.get("category") or "").strip()
-        header, rows = build_clean_export(
-            category=category,
-            include_sub=bool(data.get("include_sub", True)),
-            include_dates=bool(data.get("include_dates", True)),
-            include_used=bool(data.get("include_used", True)),
-            include_color=bool(data.get("include_color", False)),
-        )
-        if not rows:
+        if not build_clean_export(category=category, **opts)[1] and layout == "single":
             return jsonify({"error": "There is nothing to export in that selection."}), 400
 
+    if layout == "folders":
+        target = (data.get("path") or "").strip() or pick_directory_native(
+            "Choose where to save the export (a new folder is created inside)")
+    else:
         default = (safe_filename(category.replace("/", "-")) or "inventory") + "_export.csv"
         target = (data.get("path") or "").strip() or pick_save_file_native(default)
-        if not target:
-            return jsonify({"cancelled": True})
-        if not target.lower().endswith(".csv"):
-            target += ".csv"
+    if not target:
+        return jsonify({"cancelled": True})
+
+    with LOCK:
+        ensure_files()
         try:
-            with open(target, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.writer(f)
-                w.writerow(header)
-                w.writerows(rows)
+            if layout == "folders":
+                r = export_hierarchy(target, category=category, sep=sep, **opts)
+                out, count = r["folder"], r["count"]
+                detail = f"{count} items in {r['files']} file(s) -> {out}"
+            else:
+                if not target.lower().endswith(".csv"):
+                    target += ".csv"
+                header, rows = build_clean_export(category=category, **opts)
+                write_excel_csv(target, header, rows, sep)
+                out, count, r = target, len(rows), {"files": 1}
+                detail = f"{count} items -> {out}"
         except Exception as e:
-            return jsonify({"error": f"Could not write the file: {e}"}), 400
-        log_history("export", category or "(all)", f"{len(rows)} items -> {target}")
-        return jsonify({"ok": True, "path": target, "count": len(rows)})
+            return jsonify({"error": f"Could not write the export: {e}"}), 400
+        log_history("export", category or "(all)", detail)
+    if data.get("reveal"):
+        reveal_in_file_manager(out)
+    return jsonify({"ok": True, "path": out, "count": count, "files": r.get("files", 1),
+                    "layout": layout, "separator": sep})
 
 
 @APP.route("/api/item/move", methods=["POST"])
@@ -3085,6 +3335,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   .field{margin-bottom:14px;}
   .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;}
+  .field label.opt{display:flex;align-items:flex-start;gap:10px;margin:0 0 8px;padding:10px 12px;
+    border:1px solid var(--line);border-radius:var(--radius);cursor:pointer;font-size:12.5px;line-height:1.45}
+  .field label.opt input{margin:2px 0 0;flex:none;width:auto;padding:0}
+  .field label.opt b{color:var(--text)}
+  .field label.opt:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
   .field input,.field select,.field textarea{
     width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);
     padding:8px 10px;border-radius:6px;font-size:14px;font-family:inherit;
@@ -4618,31 +4873,65 @@ async function addToOrder(name){
 // ---------- export ----------
 function openExportModal(){
   const cat=SELECTED;
-  const body=`<p class="muted">Writes a clean CSV with just your data — no internal ids or program columns.</p>
+  const pref=k=>{ try{ return localStorage.getItem(k); }catch(e){ return null; } };
+  const keep=(k,v)=>{ try{ localStorage.setItem(k,v); }catch(e){} };
+  const layout=pref("inv_export_layout")||"folders";
+  const sepPref=pref("inv_export_sep")||"auto";
+  const auto=STATE.csv_separator===";" ? "semicolon ;" : "comma ,";
+  const body=`<p class="muted">Clean CSV files with just your data — no internal ids or program columns —
+      that open in Excel with a double-click.</p>
     <div class="field"><label>What to export</label>
       <select id="expScope">
         <option value="all">Everything (${STATE.item_count} items)</option>
         ${cat?`<option value="cat" selected>Only "${esc(cat)}" and its subcategories</option>`:""}
       </select></div>
+    <div class="field"><label>Layout</label>
+      <label class="opt">
+        <input type="radio" name="expLayout" value="folders" ${layout==="folders"?"checked":""}>
+        <span><b>Folders, like the category tree</b> — one CSV per category; a category with
+        subcategories becomes a folder. Includes <code>_Overview.csv</code> listing every category.</span></label>
+      <label class="opt">
+        <input type="radio" name="expLayout" value="single" ${layout==="single"?"checked":""}>
+        <span><b>One file with everything</b> — a Category column shows where each item belongs.</span></label>
+    </div>
+    <div class="field"><label>Column separator</label>
+      <select id="expSep">
+        <option value="auto" ${sepPref==="auto"?"selected":""}>Automatic — ${auto} (what Excel on this computer expects)</option>
+        <option value=";" ${sepPref===";"?"selected":""}>Semicolon ; (Excel with German / European settings)</option>
+        <option value="," ${sepPref===","?"selected":""}>Comma , (Excel with English / US settings)</option>
+      </select></div>
     <label class="check" style="margin:8px 0"><input type="checkbox" id="expDates" checked> include date columns</label>
     <label class="check" style="margin:8px 0"><input type="checkbox" id="expUsed" checked> include status / used-for columns</label>
-    <label class="check" style="margin:8px 0"><input type="checkbox" id="expColor"> include colour column</label>`;
+    <label class="check" style="margin:8px 0"><input type="checkbox" id="expColor"> include colour column</label>
+    <label class="check" style="margin:8px 0"><input type="checkbox" id="expReveal" checked> show the result in ${
+      navigator.platform.toLowerCase().includes("mac")?"Finder":"Explorer"} when done</label>`;
   const foot=`<button class="btn ghost" onclick="closeModal()">Cancel</button>
-    <button class="btn primary" id="expGo">Choose file &amp; export</button>`;
-  const m=modalShell("Export CSV", body, foot); showModal(m);
-  m.querySelector("#expGo").onclick=async()=>{
-    const btn=m.querySelector("#expGo"); btn.disabled=true; btn.textContent="Choose a location…";
+    <button class="btn primary" id="expGo"></button>`;
+  const m=modalShell("Export", body, foot); showModal(m);
+  const btn=m.querySelector("#expGo");
+  const chosen=()=>m.querySelector('input[name="expLayout"]:checked').value;
+  const label=()=>{ btn.textContent = chosen()==="folders" ? "Choose folder & export" : "Choose file & export"; };
+  m.querySelectorAll('input[name="expLayout"]').forEach(r=>r.onchange=label);
+  label();
+  btn.onclick=async()=>{
+    const lay=chosen(), sep=m.querySelector("#expSep").value;
+    keep("inv_export_layout", lay); keep("inv_export_sep", sep);
+    btn.disabled=true; btn.textContent="Choose a location…";
     try{
       const r=await api("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({
           category:m.querySelector("#expScope").value==="cat"?cat:"",
-          include_sub:true,
+          layout:lay, separator:sep,
           include_dates:m.querySelector("#expDates").checked,
           include_used:m.querySelector("#expUsed").checked,
-          include_color:m.querySelector("#expColor").checked})});
-      if(r.cancelled){ btn.disabled=false; btn.textContent="Choose file & export"; return; }
-      toast(`Exported ${r.count} item(s)`); closeModal();
-    }catch(e){ toast(e.error||"Export failed","err"); btn.disabled=false; btn.textContent="Choose file & export"; }
+          include_color:m.querySelector("#expColor").checked,
+          reveal:m.querySelector("#expReveal").checked})});
+      if(r.cancelled){ btn.disabled=false; label(); return; }
+      toast(lay==="folders"
+        ? `Exported ${r.count} item(s) into ${r.files} file(s)`
+        : `Exported ${r.count} item(s)`);
+      closeModal();
+    }catch(e){ toast(e.error||"Export failed","err"); btn.disabled=false; label(); }
   };
 }
 

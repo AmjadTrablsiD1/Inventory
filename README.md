@@ -498,6 +498,8 @@ Your chosen data folder is remembered in `~/.inventory_manager_config.json`.
 
 This is a **local, single-user application with no authentication**. It deliberately binds to `127.0.0.1` only, so it is reachable just from the machine it runs on.
 
+The app does not use Node.js or any JavaScript packages: the page is plain JavaScript built into `app.py`, and nothing is loaded from the internet. Its only dependencies are Flask (with Werkzeug) and, for Excel import, openpyxl. It also serves no files from disk over the web: Flask's built-in `/static` route is switched off, which keeps Werkzeug advisory GHSA-g6x2-hccm-hh4m (a Windows device name such as `NUL:` hanging a request) out of reach whatever Werkzeug version is installed. `requirements.txt` asks for Werkzeug 3.1.9 or newer anyway.
+
 Do not change the host to `0.0.0.0` or put it on a public network. It exposes endpoints that read and write files on the host, and it has no login, no permissions, and no CSRF protection. If you need multiple people to use it, share the **data folder** over a network drive and let each person run their own local copy.
 
 ---

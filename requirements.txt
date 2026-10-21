@@ -2,6 +2,8 @@
 #   pip install -r requirements.txt
 
 flask>=2.0
+# 3.1.9 fixes GHSA-g6x2-hccm-hh4m (Windows device names in safe_join)
+werkzeug>=3.1.9
 
 # Only needed to import .xlsx / .xlsm files. Plain .csv import works without it.
 openpyxl>=3.0

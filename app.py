@@ -68,7 +68,12 @@ except ModuleNotFoundError:
 # Configuration
 # ----------------------------------------------------------------------------
 
-APP = Flask(__name__)
+# No static folder: the page is self-contained. Flask would otherwise add a
+# /static/<path> route served by send_from_directory, the code path behind
+# Werkzeug advisory GHSA-g6x2-hccm-hh4m (a request for a Windows device name
+# such as "NUL:" hangs the request). Without the route it cannot be reached,
+# whichever Werkzeug version a computer happens to have installed.
+APP = Flask(__name__, static_folder=None)
 
 LOCK_NAME = ".inventory.lock"
 LOCK_STALE_SECONDS = 45      # a lock older than this is assumed abandoned
@@ -213,7 +218,7 @@ def atomic_write(path, encoding="utf-8-sig", newline=""):
 
 # Bump this when you publish a new version. The updater compares it with the
 # APP_VERSION in the copy of app.py on GitHub.
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.17.1"
 
 # Where updates come from. Normally auto-detected from this checkout's git
 # remote; set INVENTORY_REPO ("owner/name") to override.
